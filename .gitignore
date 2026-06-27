@@ -1,0 +1,2 @@
+*.toml
+!secrets.toml.example
