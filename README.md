@@ -86,6 +86,12 @@ Requires `ffmpeg` installed locally (`apt install ffmpeg` / `brew install ffmpeg
 
 ## Notes & gotchas
 
+- **If image generation fails with a connection/DNS error or "no provider available"**:
+  Hugging Face's free image API has changed backends before and may again —
+  the app uses their official `huggingface_hub` client with automatic provider
+  routing (not a hardcoded URL) specifically to absorb most such changes, but
+  if a *specific model* stops being served for free, switch to a different
+  model in the sidebar dropdown rather than waiting for it to come back.
 - **Music levels auto-normalize**: instead of a flat volume cut, each music
   track is measured and adjusted to a consistent loudness (LUFS) before
   mixing under the narration. This means quiet-mastered and loud-mastered

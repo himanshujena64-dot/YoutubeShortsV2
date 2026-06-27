@@ -10,9 +10,9 @@ import zipfile
 from datetime import datetime
 
 import pandas as pd
-import requests
 import streamlit as st
 from elevenlabs.client import ElevenLabs
+from huggingface_hub import InferenceClient as HFInferenceClient
 
 st.set_page_config(page_title="Shorts Maker", page_icon="🎬", layout="wide")
 
@@ -97,21 +97,23 @@ def render_step1():
         return
 
     HF_TOKEN = st.secrets["HF_API_TOKEN"]
+    hf_client = HFInferenceClient(api_key=HF_TOKEN, provider="auto")
 
     with st.sidebar:
         st.subheader("Step 1 settings")
         model_id = st.selectbox(
             "Hugging Face model",
             [
-                "stabilityai/stable-diffusion-xl-base-1.0",
                 "black-forest-labs/FLUX.1-schnell",
-                "runwayml/stable-diffusion-v1-5",
+                "black-forest-labs/FLUX.1-dev",
+                "stabilityai/stable-diffusion-3.5-large-turbo",
             ],
             index=0,
             help=(
-                "Free HF Inference API models. Availability and speed vary day to day "
-                "since these run on shared free infrastructure — if one model errors "
-                "or times out repeatedly, try another from this list."
+                "Models currently routed through Hugging Face's Inference Providers "
+                "(provider=auto picks whichever backend is available). FLUX.1-schnell "
+                "is fastest and a good free default — if one model errors or times out "
+                "repeatedly, try another from this list."
             ),
             key="step1_model",
         )
@@ -193,24 +195,15 @@ def render_step1():
     st.dataframe(df[["id", "script_text", "image_prompt"]], use_container_width=True)
 
     def generate_image(prompt: str, model: str, w: int, h: int, retries: int) -> bytes:
-        url = f"https://api-inference.huggingface.co/models/{model}"
-        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-        payload = {
-            "inputs": prompt,
-            "parameters": {"width": w, "height": h},
-            "options": {"wait_for_model": True},
-        }
         last_error = None
         for attempt in range(retries + 1):
             try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=120)
-                if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-                    return resp.content
-                try:
-                    err_json = resp.json()
-                    last_error = err_json.get("error", str(err_json))
-                except Exception:
-                    last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                pil_image = hf_client.text_to_image(
+                    prompt, model=model, width=w, height=h,
+                )
+                buf = io.BytesIO()
+                pil_image.save(buf, format="PNG")
+                return buf.getvalue()
             except Exception as e:
                 last_error = str(e)
             if attempt < retries:
@@ -245,7 +238,12 @@ def render_step1():
         st.success(f"{n_ok}/{total} images generated successfully.")
 
         if n_ok == 0:
-            st.error("No images succeeded — check your HF token and model selection, then try again.")
+            st.error(
+                "No images succeeded — check the error messages in the table above. "
+                "Common causes: an invalid/expired HF_API_TOKEN, or the selected model "
+                "currently has no available free provider (try a different model from "
+                "the sidebar dropdown — availability shifts over time)."
+            )
             return
 
         # Save into shared session state so Step 2 can pick these up automatically
