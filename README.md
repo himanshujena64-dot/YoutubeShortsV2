@@ -92,26 +92,42 @@ Requires `ffmpeg` installed locally (`apt install ffmpeg` / `brew install ffmpeg
 
 ## Cost reality, honestly
 
-- **Cloudflare free tier**: 10,000 Neurons/day, no card required, ever, for
-  this tier. `flux-1-schnell` costs roughly 50-80 Neurons per image (varies
-  with steps), so a single account comfortably covers **100+ images per
-  day** for free — several full Shorts worth, every day, indefinitely.
+- **Cloudflare free tier**: 10,000 Neurons/day, no card required, ever.
+  How far that goes depends heavily on which model and resolution you pick:
+  - `flux-1-schnell` (no size control, fixed square-ish output): **100+ free
+    images/day** — cheapest by far, but can't produce true 9:16.
+  - `phoenix-1.0` / `lucid-origin` at **540x960** (9:16, lower-res): **~9 free
+    images/day**
+  - Same models at **720x1280**: **~5 free images/day**
+  - Same models at full **1080x1920**: **~2 free images/day** — a 20-scene
+    Short would blow through several days' free allowance in one batch.
+  - These are estimates based on Cloudflare's published per-tile/per-step
+    pricing; actual Neuron cost can vary slightly.
+- **Practical recommendation**: for a real 9:16 Short with many scenes, use
+  540x960 or 720x1280 — both are genuinely vertical (not cropped) and look
+  fine on a phone screen, while keeping your daily batch within the free
+  allowance. Save full 1080x1920 for a handful of "hero" scenes, or enable
+  billing if you want every scene at full resolution.
 - **If you exceed 10,000 Neurons/day**: requests simply fail until the reset
   (00:00 UTC) unless you upgrade to a Workers Paid plan ($0.011/1,000
-  Neurons beyond the free allowance) — for a hobby project this is very
-  unlikely to matter.
+  Neurons beyond the free allowance).
 - **ElevenLabs**: bills by character — a 90-120 second Short is roughly
   700-1000 characters, well within Starter plan limits for a handful of
   Shorts/month.
 
 ## Notes & gotchas
 
-- **No aspect-ratio control on Step 1's images**: Cloudflare's hosted
-  `flux-1-schnell` only accepts a `prompt` and `steps` parameter — no
-  width/height or aspect-ratio input. Images come back roughly square.
-  This is fine: Step 2's pan/zoom step already scales and crops every image
-  to vertical 9:16 as part of generating the video, so no extra step is
-  needed on your end.
+- **Output format**: Cloudflare's hosted models always return JPEG with no
+  format option in their API — the app automatically converts every image to
+  PNG before handing it to Step 2 (or before you download the backup ZIP),
+  so you always get `.png` files.
+- **Aspect ratio depends on model choice**: `phoenix-1.0` and `lucid-origin`
+  support a real 9:16 vertical output (the sidebar lets you pick the exact
+  resolution). `flux-1-schnell` has no size control at all — it always
+  returns a fixed square-ish image, regardless of any sidebar setting. If
+  you pick flux for its much larger free-image budget, Step 2's pan/zoom
+  step will scale/crop it to vertical when building the video, but for
+  true 9:16 framing from the start, use one of the Leonardo models instead.
 - **If image generation fails**: double check both `CLOUDFLARE_ACCOUNT_ID`
   and `CLOUDFLARE_API_TOKEN` are correct, and that the API token has
   "Workers AI" permissions (the dashboard's "Create a Workers AI API Token"

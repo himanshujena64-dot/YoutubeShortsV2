@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from elevenlabs.client import ElevenLabs
+from PIL import Image
 
 st.set_page_config(page_title="Shorts Maker", page_icon="🎬", layout="wide")
 
@@ -109,36 +110,58 @@ def render_step1():
         model_id = st.selectbox(
             "Cloudflare image model",
             [
-                "@cf/black-forest-labs/flux-1-schnell",
                 "@cf/leonardo/phoenix-1.0",
                 "@cf/leonardo/lucid-origin",
             ],
             index=0,
             help=(
-                "flux-1-schnell is fast, cheap (~4-8 Neurons/step), and a good default. "
-                "All run on Cloudflare's free 10,000-Neurons/day allowance — no billing "
-                "needed for typical batch sizes."
+                "Both models support width/height, so they generate true 9:16 vertical "
+                "images for Shorts. phoenix-1.0 is the recommended default — great quality "
+                "and reliable. lucid-origin is an alternative style. Both run on Cloudflare's "
+                "free 10,000-Neurons/day allowance (no credit card needed)."
             ),
             key="step1_model",
         )
+        supports_size = True  # both listed models support width/height
+
         style_suffix = st.text_input(
             "Style suffix (added to every prompt)",
             value="cinematic, highly detailed, dramatic lighting",
             help="Appended to every image_prompt to keep a consistent look across scenes.",
             key="step1_style",
         )
+
+        aspect = st.selectbox(
+            "Resolution (all 9:16 vertical for Shorts)",
+            [
+                "540x960  — ~9 free images/day  [recommended]",
+                "720x1280 — ~5 free images/day",
+                "1080x1920 — ~2 free images/day",
+            ],
+            index=0,
+            help=(
+                "All options are genuine 9:16 — not cropped. 540×960 is the sweet spot "
+                "for the free tier: looks sharp on any phone and lets you generate the most "
+                "images per day. 1080×1920 burns most of your daily 10,000-Neuron allowance "
+                "in just 2 images — only use it for a small batch or if you have billing enabled."
+            ),
+            key="step1_aspect",
+        )
+        size_map = {
+            "540x960  — ~9 free images/day  [recommended]": (540, 960),
+            "720x1280 — ~5 free images/day": (720, 1280),
+            "1080x1920 — ~2 free images/day": (1080, 1920),
+        }
+        img_width, img_height = size_map[aspect]
+
         steps = st.slider(
             "Diffusion steps (quality vs. speed/cost)", 1, 8, 4,
             help=(
                 "Higher = better quality but slower and slightly more Neurons used. "
-                "flux-1-schnell caps at 8. 4 is a good default."
+                "flux-1-schnell caps at 8; Leonardo models support more but 4-8 is "
+                "a good default for speed and cost."
             ),
             key="step1_steps",
-        )
-        st.caption(
-            "Note: this model generates a fixed square-ish image — there's no "
-            "aspect-ratio control on Cloudflare's hosted version. Step 2's pan/zoom "
-            "already crops/scales images to vertical 9:16, so this works fine as-is."
         )
         pace_delay = st.slider(
             "Delay between images (seconds)", 0, 5, 1,
@@ -209,10 +232,19 @@ def render_step1():
     st.success(f"Loaded {len(df)} scene(s).")
     st.dataframe(df[["id", "script_text", "image_prompt"]], use_container_width=True)
 
-    def generate_image(prompt: str, model: str, num_steps: int, retries: int) -> bytes:
+    def generate_image(
+        prompt: str, model: str, num_steps: int, retries: int,
+        width: int = None, height: int = None,
+    ) -> bytes:
         url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{model}"
         headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
-        payload = {"prompt": prompt, "steps": num_steps}
+        # flux-1-schnell only accepts {prompt, steps}. The Leonardo models
+        # (phoenix-1.0, lucid-origin) accept width/height plus num_steps —
+        # sending num_steps (not steps) satisfies both their documented schemas.
+        if width and height:
+            payload = {"prompt": prompt, "width": width, "height": height, "num_steps": num_steps}
+        else:
+            payload = {"prompt": prompt, "steps": num_steps}
 
         last_error = None
         for attempt in range(retries + 1):
@@ -220,7 +252,40 @@ def render_step1():
                 resp = requests.post(url, headers=headers, json=payload, timeout=60)
                 data = resp.json()
                 if resp.status_code == 200 and data.get("success") and data.get("result", {}).get("image"):
-                    return base64.b64decode(data["result"]["image"])
+                    jpeg_bytes = base64.b64decode(data["result"]["image"])
+                    # Cloudflare always returns JPEG — convert to PNG for consistency.
+                    img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+
+                    # ── 9:16 safety net ──────────────────────────────────────────
+                    # If the API ignored our width/height and returned a square
+                    # (shouldn't happen with Leonardo, but guards against surprises),
+                    # force the image to the requested 9:16 dimensions:
+                    #   • Too wide → centre-crop horizontally
+                    #   • Too tall  → centre-crop vertically
+                    #   • Wrong size entirely → resize to target
+                    if width and height and img.size != (width, height):
+                        target_ratio = width / height
+                        src_w, src_h = img.size
+                        src_ratio = src_w / src_h
+                        if abs(src_ratio - target_ratio) > 0.01:
+                            # Need to crop to match aspect ratio first
+                            if src_ratio > target_ratio:
+                                # Image is wider than needed — crop sides
+                                new_w = int(src_h * target_ratio)
+                                left = (src_w - new_w) // 2
+                                img = img.crop((left, 0, left + new_w, src_h))
+                            else:
+                                # Image is taller than needed — crop top/bottom
+                                new_h = int(src_w / target_ratio)
+                                top = (src_h - new_h) // 2
+                                img = img.crop((0, top, src_w, top + new_h))
+                        # Final resize to exact target resolution
+                        img = img.resize((width, height), Image.LANCZOS)
+                    # ─────────────────────────────────────────────────────────────
+
+                    png_buf = io.BytesIO()
+                    img.save(png_buf, format="PNG")
+                    return png_buf.getvalue()
                 errors = data.get("errors") or [{"message": resp.text[:200]}]
                 last_error = "; ".join(e.get("message", str(e)) for e in errors)
             except Exception as e:
@@ -241,8 +306,10 @@ def render_step1():
             prompt = f"{str(row['image_prompt']).strip()}, {style_suffix}".strip(", ")
             status.write(f"Generating {i+1}/{total}: `{scene_id}`")
             try:
-                img_bytes = generate_image(prompt, model_id, steps, max_retries)
-                fname = f"{safe_name(scene_id)}.jpg"
+                img_bytes = generate_image(
+                    prompt, model_id, steps, max_retries, width=img_width, height=img_height
+                )
+                fname = f"{safe_name(scene_id)}.png"
                 image_bufs[scene_id] = (fname, img_bytes)
                 results.append({"id": scene_id, "image_prompt": prompt, "status": "✅ Success"})
             except Exception as e:
