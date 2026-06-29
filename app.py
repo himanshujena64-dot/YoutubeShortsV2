@@ -32,21 +32,61 @@ if "generated_images_log" not in st.session_state:
 # ---------------------------------------------------------------------------
 # Mood classifier (Step 2 background music)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Music moods — 10 categories. Create a folder under music/ for each key
+# and drop .mp3/.wav/.m4a files in. The classifier picks the best match.
+# ---------------------------------------------------------------------------
 MOOD_KEYWORDS = {
     "upbeat": [
         "win", "won", "victory", "celebrat", "happy", "joy", "exciting",
         "amazing", "success", "triumph", "champion", "festival", "fun",
-        "bright", "smile", "achieve", "proud", "cheer",
+        "bright", "smile", "achieve", "proud", "cheer", "party", "dance",
     ],
     "dramatic": [
         "war", "battle", "fight", "danger", "crisis", "death", "fear",
         "tension", "struggle", "fierce", "darkness", "betray", "shock",
         "underdog", "pressure", "risk", "storm", "collapse", "desperate",
+        "villain", "enemy", "confront", "survive",
     ],
     "calm": [
         "calm", "quiet", "peace", "gentle", "slow", "reflect", "history",
         "memory", "story", "remember", "morning", "soft", "ordinary",
-        "simple", "everyday",
+        "simple", "everyday", "breathe", "still", "serene",
+    ],
+    "inspirational": [
+        "hope", "dream", "rise", "believe", "inspire", "courage", "overcome",
+        "strong", "persevere", "never give up", "faith", "possible", "will",
+        "determination", "motivat", "aspire", "goal", "future", "change",
+    ],
+    "suspense": [
+        "secret", "hidden", "mystery", "unknown", "shadow", "watch", "lurk",
+        "follow", "hunt", "trace", "clue", "reveal", "uncover", "suspect",
+        "silence", "wait", "dark", "tension", "crawl", "creep",
+    ],
+    "sad": [
+        "sad", "loss", "grief", "mourn", "alone", "lonely", "cry", "tears",
+        "heartbreak", "miss", "gone", "farewell", "goodbye", "regret",
+        "pain", "suffer", "sorrow", "tragedy", "lost", "broke",
+    ],
+    "romantic": [
+        "love", "heart", "together", "forever", "romance", "kiss", "hold",
+        "care", "affection", "partner", "couple", "wed", "marriage",
+        "tender", "warmth", "embrace", "cherish", "devoted",
+    ],
+    "epic": [
+        "legend", "hero", "quest", "journey", "great", "mighty", "power",
+        "glory", "conquer", "army", "throne", "king", "empire", "ancient",
+        "warrior", "sword", "shield", "myth", "destiny", "chosen",
+    ],
+    "energetic": [
+        "run", "race", "sprint", "fast", "speed", "rush", "action",
+        "adrenaline", "pump", "explosive", "intense", "burst", "fire",
+        "charge", "push", "go", "now", "fast", "hustle", "grind",
+    ],
+    "nostalgic": [
+        "nostalg", "childhood", "remember", "those days", "used to", "back then",
+        "classic", "vintage", "old", "young", "grew up", "past", "decade",
+        "era", "generation", "tradition", "heritage", "roots", "origin",
     ],
 }
 
@@ -62,11 +102,25 @@ def classify_mood(full_text: str) -> str:
 
 
 def pick_music_track(mood: str, music_root: str):
-    folder = os.path.join(music_root, mood)
-    candidates = []
-    for ext in ("*.mp3", "*.wav", "*.m4a"):
-        candidates.extend(glob.glob(os.path.join(folder, ext)))
-    return random.choice(candidates) if candidates else None
+    """Pick a random track for the given mood. Falls back to any available
+    track from other mood folders if the requested mood folder is empty."""
+    def tracks_in(folder):
+        result = []
+        for ext in ("*.mp3", "*.wav", "*.m4a"):
+            result.extend(glob.glob(os.path.join(folder, ext)))
+        return result
+
+    # Try exact mood first
+    candidates = tracks_in(os.path.join(music_root, mood))
+    if candidates:
+        return random.choice(candidates)
+
+    # Fallback: scan all mood folders and pick from whatever has files
+    all_tracks = []
+    for entry in os.scandir(music_root):
+        if entry.is_dir():
+            all_tracks.extend(tracks_in(entry.path))
+    return random.choice(all_tracks) if all_tracks else None
 
 
 def safe_name(s: str) -> str:
@@ -323,19 +377,39 @@ def render_step2():
     with st.sidebar:
         st.subheader("Step 2 — Video settings")
 
+        # Try to load voices from ElevenLabs. If the API key is missing the
+        # voices_read permission (401), fall back to a manual voice ID input
+        # so the rest of the app still works.
         @st.cache_data(ttl=3600)
-        def get_voices():
-            resp = el_client.voices.get_all()
-            return {v.name: v.voice_id for v in resp.voices}
+        def get_voices_safe(api_key: str):
+            try:
+                client_tmp = ElevenLabs(api_key=api_key)
+                resp = client_tmp.voices.get_all()
+                return {v.name: v.voice_id for v in resp.voices}, None
+            except Exception as e:
+                return {}, str(e)
 
-        try:
-            voice_options = get_voices()
-        except Exception as e:
-            st.error(f"Could not load ElevenLabs voices: {e}")
-            return
+        voice_options, voices_err = get_voices_safe(st.secrets["ELEVENLABS_API_KEY"])
 
-        voice_name = st.selectbox("Narrator voice", list(voice_options.keys()), key="step2_voice")
-        voice_id = voice_options[voice_name]
+        if voices_err:
+            st.warning(
+                f"⚠️ Could not load voice list: voices_read permission missing on your API key.\n\n"
+                "**Fix:** Go to [elevenlabs.io](https://elevenlabs.io) → Profile → API Keys → "
+                "edit your key → enable **voices_read**. Then refresh this page.\n\n"
+                "For now, paste a Voice ID manually below."
+            )
+            voice_id = st.text_input(
+                "Voice ID (paste from elevenlabs.io → Voices → click a voice → ID)",
+                value="",
+                key="step2_voice_id_manual",
+            ).strip()
+            if not voice_id:
+                st.info("Enter a Voice ID above to continue.")
+        else:
+            voice_name = st.selectbox(
+                "Narrator voice", list(voice_options.keys()), key="step2_voice"
+            )
+            voice_id = voice_options[voice_name]
 
         tts_model = st.selectbox(
             "ElevenLabs model",
@@ -345,8 +419,59 @@ def render_step2():
             key="step2_tts_model",
         )
 
-        zoom_direction = st.selectbox(
-            "Pan/zoom style", ["Slow zoom in", "Slow zoom out"], index=0, key="step2_zoom"
+        st.divider()
+        st.subheader("Voice controls")
+        voice_stability = st.slider(
+            "Stability", 0.0, 1.0, 0.5, 0.05,
+            help="Low = expressive/varied. High = consistent/monotone. 0.5 is a good default.",
+            key="step2_stability",
+        )
+        voice_similarity = st.slider(
+            "Similarity boost", 0.0, 1.0, 0.75, 0.05,
+            help="How closely output matches the original voice. Keep above 0.7.",
+            key="step2_similarity",
+        )
+        voice_style = st.slider(
+            "Style exaggeration", 0.0, 1.0, 0.0, 0.05,
+            help="0 = off (best for narration). Raise for more dramatic delivery.",
+            key="step2_style",
+        )
+        voice_speed = st.slider(
+            "Speed", 0.7, 1.3, 1.0, 0.05,
+            help="0.7 = slow/deliberate. 1.0 = normal. 1.3 = fast paced.",
+            key="step2_speed",
+        )
+
+        st.divider()
+        st.subheader("Motion effect")
+        effect_mode = st.radio(
+            "Effect selection",
+            ["🤖 Auto — AI picks per scene", "✋ Manual — same for all scenes"],
+            index=0,
+            key="step2_effect_mode",
+            help=(
+                "Auto: reads each scene's script_text and picks the most fitting "
+                "motion effect automatically.\n\n"
+                "Manual: you pick one effect applied to every scene."
+            ),
+        )
+        EFFECTS = [
+            "Slow zoom in",
+            "Slow zoom out",
+            "Pan left → right",
+            "Pan right → left",
+            "Pan top → bottom",
+            "Ken Burns (zoom + diagonal pan)",
+            "Fade in / Fade out",
+            "Cross dissolve",
+            "Handheld shake",
+        ]
+        manual_effect = st.selectbox(
+            "Effect (manual mode)",
+            EFFECTS,
+            index=0,
+            disabled=(effect_mode == "🤖 Auto — AI picks per scene"),
+            key="step2_manual_effect",
         )
 
         st.divider()
@@ -360,9 +485,26 @@ def render_step2():
         )
         music_override = st.selectbox(
             "Mood override",
-            ["Auto-detect from script", "Force: upbeat", "Force: dramatic", "Force: calm"],
+            [
+                "Auto-detect from script",
+                "Force: upbeat",
+                "Force: dramatic",
+                "Force: calm",
+                "Force: inspirational",
+                "Force: suspense",
+                "Force: sad",
+                "Force: romantic",
+                "Force: epic",
+                "Force: energetic",
+                "Force: nostalgic",
+            ],
             index=0,
             disabled=not enable_music,
+            help=(
+                "Auto: scores your script against keyword lists and picks the best mood.\n\n"
+                "Each mood maps to a folder under music/ — drop .mp3/.wav files there. "
+                "If a folder is empty, it falls back to the next best match."
+            ),
             key="step2_music_mood",
         )
 
@@ -512,8 +654,16 @@ def render_step2():
         for attempt in range(3):
             try:
                 audio_iter = el_client.text_to_speech.convert(
-                    voice_id=voice_id, text=text, model_id=tts_model,
+                    voice_id=voice_id,
+                    text=text,
+                    model_id=tts_model,
                     output_format="mp3_44100_128",
+                    voice_settings={
+                        "stability": voice_stability,
+                        "similarity_boost": voice_similarity,
+                        "style": voice_style,
+                        "speed": voice_speed,
+                    },
                 )
                 with open(out_path, "wb") as f:
                     for chunk in audio_iter:
@@ -533,15 +683,148 @@ def render_step2():
         )
         return float(r.stdout.strip())
 
-    def make_panzoom_clip(image_path: str, duration: float, out_path: str, zoom_in: bool):
+    # ── AI effect classifier ──────────────────────────────────────────────────
+    EFFECT_KEYWORDS = {
+        "Ken Burns (zoom + diagonal pan)": [
+            "war", "battle", "fight", "intense", "fierce", "danger", "crisis",
+            "explosion", "attack", "charge", "dramatic", "epic", "climax",
+            "death", "shock", "desperate", "collapse", "storm",
+        ],
+        "Slow zoom in": [
+            "focus", "reveal", "discover", "realise", "realize", "moment",
+            "pause", "silence", "stood", "stared", "watched", "waited",
+            "emotional", "grief", "tears", "smile", "proud", "achieve",
+        ],
+        "Slow zoom out": [
+            "vast", "wide", "crowd", "stadium", "horizon", "land", "field",
+            "world", "sky", "open", "landscape", "spread", "panorama",
+            "everyone", "nation", "country", "million",
+        ],
+        "Pan left → right": [
+            "march", "walk", "move", "journey", "travel", "progress",
+            "forward", "advance", "cross", "enter", "parade",
+        ],
+        "Pan right → left": [
+            "return", "retreat", "back", "history", "memory", "past",
+            "recall", "remind", "once", "before", "ago",
+        ],
+        "Pan top → bottom": [
+            "fall", "drop", "descend", "collapse", "down", "below",
+            "ground", "earth", "kneel", "bow",
+        ],
+        "Fade in / Fade out": [
+            "begin", "start", "end", "final", "last", "first", "dawn",
+            "night", "sleep", "dream", "quiet", "peace", "calm",
+        ],
+        "Cross dissolve": [
+            "then", "next", "after", "later", "meanwhile", "suddenly",
+            "transition", "change", "transform", "become", "turned",
+        ],
+        "Handheld shake": [
+            "run", "rush", "chase", "hurry", "panic", "chaos", "crowd",
+            "noise", "confusion", "scramble", "flee", "escape",
+        ],
+    }
+
+    def ai_pick_effect(text: str) -> str:
+        """Score the scene text against keyword lists and return the best effect."""
+        t = text.lower()
+        scores = {effect: 0 for effect in EFFECT_KEYWORDS}
+        for effect, keywords in EFFECT_KEYWORDS.items():
+            for kw in keywords:
+                scores[effect] += len(re.findall(r"\b" + kw + r"\b", t))
+        best = max(scores, key=scores.get)
+        # If no keyword matched, cycle through neutral effects based on text length
+        if scores[best] == 0:
+            neutral = ["Slow zoom in", "Pan left → right", "Slow zoom out", "Pan right → left"]
+            return neutral[len(text) % len(neutral)]
+        return best
+
+    # ── Motion effect renderer ─────────────────────────────────────────────────
+    def make_clip(image_path: str, duration: float, out_path: str, effect: str):
+        """Render one scene clip with the chosen motion effect."""
         fps = 25
         frames = max(int(duration * fps), 1)
-        zoom_expr = "min(zoom+0.0015,1.3)" if zoom_in else "if(eq(on,1),1.3,max(zoom-0.0015,1.0))"
-        vf = (
-            f"scale=2160:3840,"
-            f"zoompan=z='{zoom_expr}':d={frames}:"
-            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps={fps}"
-        )
+        TARGET = "1080x1920"
+        SCALE_UP = "scale=2160:3840,"   # upscale so zoompan has room to crop
+
+        if effect == "Slow zoom in":
+            vf = (
+                f"{SCALE_UP}zoompan=z='min(zoom+0.0015,1.3)':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps}"
+            )
+
+        elif effect == "Slow zoom out":
+            vf = (
+                f"{SCALE_UP}zoompan=z='if(eq(on,1),1.3,max(zoom-0.0015,1.0))':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps}"
+            )
+
+        elif effect == "Pan left → right":
+            # Pan horizontally: x moves from 0 → (iw - iw/zoom)
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.2':d={frames}:"
+                f"x='(iw-iw/zoom)*on/{frames}':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps}"
+            )
+
+        elif effect == "Pan right → left":
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.2':d={frames}:"
+                f"x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps}"
+            )
+
+        elif effect == "Pan top → bottom":
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.2':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*on/{frames}':s={TARGET}:fps={fps}"
+            )
+
+        elif effect == "Ken Burns (zoom + diagonal pan)":
+            # Zoom in while panning diagonally top-left → bottom-right
+            vf = (
+                f"{SCALE_UP}zoompan=z='min(zoom+0.002,1.4)':d={frames}:"
+                f"x='(iw-iw/zoom)*on/{frames}':y='(ih-ih/zoom)*on/{frames}':s={TARGET}:fps={fps}"
+            )
+
+        elif effect == "Fade in / Fade out":
+            fade_dur = min(0.5, duration * 0.15)
+            fade_frames = max(int(fade_dur * fps), 1)
+            start_fade_out = max(frames - fade_frames, 1)
+            # Static centre + fade in + fade out
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.0':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps},"
+                f"fade=t=in:st=0:d={fade_dur},"
+                f"fade=t=out:st={start_fade_out/fps:.3f}:d={fade_dur}"
+            )
+
+        elif effect == "Cross dissolve":
+            # Gentle slow zoom in + fade in/out for smooth scene transitions
+            fade_dur = min(0.4, duration * 0.15)
+            fade_frames = max(int(fade_dur * fps), 1)
+            start_fade_out = max(frames - fade_frames, 1)
+            vf = (
+                f"{SCALE_UP}zoompan=z='min(zoom+0.001,1.15)':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps},"
+                f"fade=t=in:st=0:d={fade_dur},"
+                f"fade=t=out:st={start_fade_out/fps:.3f}:d={fade_dur}"
+            )
+
+        elif effect == "Handheld shake":
+            # Subtle random shake using sine waves on x/y with slight zoom
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.08':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)+8*sin(on*0.7)':y='ih/2-(ih/zoom/2)+5*sin(on*1.1)'"
+                f":s={TARGET}:fps={fps}"
+            )
+
+        else:
+            # Fallback: static centre
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.0':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps}"
+            )
+
         subprocess.run(
             ["ffmpeg", "-y", "-loop", "1", "-i", image_path, "-vf", vf,
              "-t", str(duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", out_path],
@@ -585,13 +868,16 @@ def render_step2():
         results = []
         clip_paths = []
         total = len(valid_df)
-        zoom_in = zoom_direction == "Slow zoom in"
+        auto_mode = effect_mode == "🤖 Auto — AI picks per scene"
 
         for i, row in valid_df.iterrows():
             sid = str(row["id"])
             text = str(row["script_text"]).strip()
             img_path = row["image_path"]
-            status.write(f"Processing {i+1}/{total}: `{sid}`")
+
+            # Pick effect
+            chosen_effect = ai_pick_effect(text) if auto_mode else manual_effect
+            status.write(f"Processing {i+1}/{total}: `{sid}` — effect: *{chosen_effect}*")
 
             audio_path = os.path.join(work_dir, f"{safe_name(sid)}.mp3")
             video_only = os.path.join(work_dir, f"{safe_name(sid)}_video.mp4")
@@ -600,12 +886,20 @@ def render_step2():
             try:
                 generate_voiceover(text, audio_path)
                 dur = get_duration(audio_path)
-                make_panzoom_clip(img_path, dur, video_only, zoom_in)
+                make_clip(img_path, dur, video_only, chosen_effect)
                 mux(video_only, audio_path, clip_final)
                 clip_paths.append(clip_final)
-                results.append({"id": sid, "script_text": text, "duration_sec": round(dur, 2), "status": "✅ OK"})
+                results.append({
+                    "id": sid, "script_text": text,
+                    "effect": chosen_effect,
+                    "duration_sec": round(dur, 2), "status": "✅ OK",
+                })
             except Exception as e:
-                results.append({"id": sid, "script_text": text, "duration_sec": None, "status": f"❌ {e}"})
+                results.append({
+                    "id": sid, "script_text": text,
+                    "effect": chosen_effect,
+                    "duration_sec": None, "status": f"❌ {e}",
+                })
 
             progress.progress((i + 1) / total)
 
