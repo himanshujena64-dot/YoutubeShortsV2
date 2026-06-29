@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from elevenlabs.client import ElevenLabs
+from openai import OpenAI
 from PIL import Image
 
 st.set_page_config(page_title="Shorts Maker", page_icon="🎬", layout="wide")
@@ -21,16 +22,15 @@ st.set_page_config(page_title="Shorts Maker", page_icon="🎬", layout="wide")
 MUSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")
 
 # ---------------------------------------------------------------------------
-# Shared session state — this is what lets Step 2 automatically see images
-# Step 1 just generated, without you having to download + re-upload a ZIP.
+# Shared session state
 # ---------------------------------------------------------------------------
 if "generated_images" not in st.session_state:
-    st.session_state.generated_images = {}  # scene_id -> (filename, bytes)
+    st.session_state.generated_images = {}   # scene_id -> (filename, bytes)
 if "generated_images_log" not in st.session_state:
-    st.session_state.generated_images_log = None  # results DataFrame from Step 1
+    st.session_state.generated_images_log = None
 
 # ---------------------------------------------------------------------------
-# Background music: mood keyword lexicon (used in Step 2)
+# Mood classifier (Step 2 background music)
 # ---------------------------------------------------------------------------
 MOOD_KEYWORDS = {
     "upbeat": [
@@ -57,10 +57,8 @@ def classify_mood(full_text: str) -> str:
     for mood, keywords in MOOD_KEYWORDS.items():
         for kw in keywords:
             scores[mood] += len(re.findall(kw, text))
-    best_mood = max(scores, key=scores.get)
-    if scores[best_mood] == 0:
-        return "calm"
-    return best_mood
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "calm"
 
 
 def pick_music_track(mood: str, music_root: str):
@@ -68,109 +66,83 @@ def pick_music_track(mood: str, music_root: str):
     candidates = []
     for ext in ("*.mp3", "*.wav", "*.m4a"):
         candidates.extend(glob.glob(os.path.join(folder, ext)))
-    if not candidates:
-        return None
-    return random.choice(candidates)
+    return random.choice(candidates) if candidates else None
 
 
 def safe_name(s: str) -> str:
-    s = str(s).strip()
     keep = "-_.() abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    return "".join(c for c in s if c in keep).strip().replace(" ", "_") or "scene"
+    return "".join(c for c in str(s).strip() if c in keep).strip().replace(" ", "_") or "scene"
 
 
-# ---------------------------------------------------------------------------
-# Step 1: Image Generator (Cloudflare Workers AI)
-# ---------------------------------------------------------------------------
+def ensure_9x16(img: Image.Image, width: int, height: int) -> Image.Image:
+    """Centre-crop then resize any image to exact w×h (9:16)."""
+    if img.size == (width, height):
+        return img
+    target_ratio = width / height
+    src_w, src_h = img.size
+    src_ratio = src_w / src_h
+    if abs(src_ratio - target_ratio) > 0.01:
+        if src_ratio > target_ratio:
+            new_w = int(src_h * target_ratio)
+            left = (src_w - new_w) // 2
+            img = img.crop((left, 0, left + new_w, src_h))
+        else:
+            new_h = int(src_w / target_ratio)
+            top = (src_h - new_h) // 2
+            img = img.crop((0, top, src_w, top + new_h))
+    return img.resize((width, height), Image.LANCZOS)
+
+
+# ===========================================================================
+# STEP 1 — OpenAI Image Generation (gpt-image-1)
+# ===========================================================================
 def render_step1():
     st.header("🖼️ Step 1: Generate Scene Images")
     st.caption(
-        "Upload one Excel with id, script_text, image_prompt → "
-        "Cloudflare Workers AI (free, no billing required) → images ready for Step 2"
+        "Upload an Excel with **id**, **script_text**, **image_prompt** → "
+        "OpenAI gpt-image-1 → true 9:16 PNG images ready for Step 2"
     )
 
-    missing_secrets = [
-        s for s in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN") if s not in st.secrets
-    ]
-    if missing_secrets:
+    if "OPENAI_API_KEY" not in st.secrets:
         st.error(
-            f"Missing required secret(s): {', '.join(missing_secrets)}. "
-            "Add them under App Settings → Secrets (Streamlit Cloud) "
-            "or .streamlit/secrets.toml (local). "
-            "Get both for free at https://dash.cloudflare.com — no credit card needed. "
-            "See the README for exact steps."
+            "Missing secret: OPENAI_API_KEY. "
+            "Add it under App Settings → Secrets or .streamlit/secrets.toml. "
+            "Get one at https://platform.openai.com/api-keys"
         )
         return
 
-    CF_ACCOUNT_ID = st.secrets["CLOUDFLARE_ACCOUNT_ID"]
-    CF_API_TOKEN = st.secrets["CLOUDFLARE_API_TOKEN"]
+    openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
+    # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.subheader("Step 1 settings")
-        model_id = st.selectbox(
-            "Cloudflare image model",
-            [
-                "@cf/leonardo/phoenix-1.0",
-                "@cf/leonardo/lucid-origin",
-            ],
+        st.subheader("Step 1 — Image settings")
+
+        quality = st.selectbox(
+            "Image quality",
+            ["medium", "low", "high"],
             index=0,
             help=(
-                "Both models support width/height, so they generate true 9:16 vertical "
-                "images for Shorts. phoenix-1.0 is the recommended default — great quality "
-                "and reliable. lucid-origin is an alternative style. Both run on Cloudflare's "
-                "free 10,000-Neurons/day allowance (no credit card needed)."
+                "low  → cheapest, ~$0.011/image — good for drafts\n"
+                "medium → balanced, ~$0.042/image — recommended\n"
+                "high → best quality, ~$0.167/image — use sparingly"
             ),
-            key="step1_model",
+            key="step1_quality",
         )
-        supports_size = True  # both listed models support width/height
 
         style_suffix = st.text_input(
-            "Style suffix (added to every prompt)",
+            "Style suffix (appended to every prompt)",
             value="cinematic, highly detailed, dramatic lighting",
-            help="Appended to every image_prompt to keep a consistent look across scenes.",
+            help="Keeps a consistent visual style across all scenes.",
             key="step1_style",
         )
 
-        aspect = st.selectbox(
-            "Resolution (all 9:16 vertical for Shorts)",
-            [
-                "540x960  — ~9 free images/day  [recommended]",
-                "720x1280 — ~5 free images/day",
-                "1080x1920 — ~2 free images/day",
-            ],
-            index=0,
-            help=(
-                "All options are genuine 9:16 — not cropped. 540×960 is the sweet spot "
-                "for the free tier: looks sharp on any phone and lets you generate the most "
-                "images per day. 1080×1920 burns most of your daily 10,000-Neuron allowance "
-                "in just 2 images — only use it for a small batch or if you have billing enabled."
-            ),
-            key="step1_aspect",
-        )
-        size_map = {
-            "540x960  — ~9 free images/day  [recommended]": (540, 960),
-            "720x1280 — ~5 free images/day": (720, 1280),
-            "1080x1920 — ~2 free images/day": (1080, 1920),
-        }
-        img_width, img_height = size_map[aspect]
-
-        steps = st.slider(
-            "Diffusion steps (quality vs. speed/cost)", 1, 8, 4,
-            help=(
-                "Higher = better quality but slower and slightly more Neurons used. "
-                "flux-1-schnell caps at 8; Leonardo models support more but 4-8 is "
-                "a good default for speed and cost."
-            ),
-            key="step1_steps",
-        )
         pace_delay = st.slider(
             "Delay between images (seconds)", 0, 5, 1,
-            help="A small delay avoids bursty rate-limit errors on larger batches.",
+            help="Small pause to avoid rate-limit bursts on large batches.",
             key="step1_pace_delay",
         )
         max_retries = st.slider(
             "Retries per image on failure", 0, 5, 2,
-            help="Helps absorb brief transient errors.",
             key="step1_retries",
         )
         project_id_step1 = st.text_input(
@@ -180,34 +152,41 @@ def render_step1():
             key="step1_project_id",
         )
 
-    script_file = st.file_uploader(
-        "Scene Excel (.xlsx)", type=["xlsx", "xls"], key="step1_upload"
+    # ── Cost info banner ──────────────────────────────────────────────────────
+    cost_map = {"low": 0.011, "medium": 0.042, "high": 0.167}
+    st.info(
+        f"💰 **Estimated cost:** ~${cost_map[quality]:.3f} per image at **{quality}** quality "
+        f"(1024×1792 px, 9:16). "
+        "No daily cap — pay only for what you generate."
     )
+
+    # ── File upload ───────────────────────────────────────────────────────────
+    script_file = st.file_uploader("Scene Excel (.xlsx)", type=["xlsx", "xls"], key="step1_upload")
     st.caption(
-        "Excel needs columns: **id**, **script_text** (used later in Step 2), "
-        "**image_prompt** (description of what the image should show)."
+        "Excel must have columns: **id** · **script_text** · **image_prompt**. "
+        "Image filenames will be `<id>.png` — these must match the `id` column in Step 2's Excel."
     )
 
     if not script_file:
-        st.info("Upload your Excel to get started.")
-        if st.button("Generate sample Excel template", key="step1_sample_btn"):
+        st.info("Upload your scene Excel to get started.")
+        if st.button("Download sample template", key="step1_sample_btn"):
             sample = pd.DataFrame({
-                "id": ["wc1983_01", "wc1983_02", "wc1983_03"],
+                "id": ["scene_01", "scene_02", "scene_03"],
                 "script_text": [
                     "In 1983, nobody expected India to win the World Cup.",
                     "The team walked onto the field at Lord's, underdogs once again.",
                     "Kapil Dev led from the front, calm under pressure.",
                 ],
                 "image_prompt": [
-                    "A cricket stadium in 1983, packed crowd, vintage photograph style",
-                    "Indian cricket team walking onto the field at Lord's, dramatic wide shot",
-                    "Kapil Dev standing confidently on the cricket pitch, determined expression",
+                    "A packed cricket stadium in 1983, vintage photograph style",
+                    "Indian cricket team walking onto the Lord's field, dramatic wide shot",
+                    "Kapil Dev standing confidently on the pitch, determined expression",
                 ],
             })
             buf = io.BytesIO()
             sample.to_excel(buf, index=False)
             st.download_button(
-                "Download template.xlsx",
+                "⬇️ scene_template.xlsx",
                 data=buf.getvalue(),
                 file_name="scene_template.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -218,81 +197,48 @@ def render_step1():
     try:
         df = pd.read_excel(script_file)
     except Exception as e:
-        st.error(f"Could not read the Excel file: {e}")
+        st.error(f"Could not read Excel: {e}")
         return
 
     df.columns = [str(c).strip().lower() for c in df.columns]
-    required_cols = {"id", "script_text", "image_prompt"}
-    missing_cols = required_cols - set(df.columns)
+    missing_cols = {"id", "script_text", "image_prompt"} - set(df.columns)
     if missing_cols:
-        st.error(f"Excel is missing required column(s): {', '.join(sorted(missing_cols))}")
+        st.error(f"Excel is missing column(s): {', '.join(sorted(missing_cols))}")
         return
 
     df = df[df["image_prompt"].notna()].reset_index(drop=True)
-    st.success(f"Loaded {len(df)} scene(s).")
+    n = len(df)
+    est_cost = n * cost_map[quality]
+    st.success(f"Loaded **{n} scene(s)**. Estimated cost: **${est_cost:.3f}**")
     st.dataframe(df[["id", "script_text", "image_prompt"]], use_container_width=True)
 
-    def generate_image(
-        prompt: str, model: str, num_steps: int, retries: int,
-        width: int = None, height: int = None,
-    ) -> bytes:
-        url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{model}"
-        headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
-        # flux-1-schnell only accepts {prompt, steps}. The Leonardo models
-        # (phoenix-1.0, lucid-origin) accept width/height plus num_steps —
-        # sending num_steps (not steps) satisfies both their documented schemas.
-        if width and height:
-            payload = {"prompt": prompt, "width": width, "height": height, "num_steps": num_steps}
-        else:
-            payload = {"prompt": prompt, "steps": num_steps}
-
-        last_error = None
-        for attempt in range(retries + 1):
+    # ── Generation ────────────────────────────────────────────────────────────
+    def generate_image_openai(prompt: str) -> bytes:
+        """Call gpt-image-1 at 1024×1792 (9:16) and return PNG bytes."""
+        last_err = None
+        for attempt in range(max_retries + 1):
             try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=60)
-                data = resp.json()
-                if resp.status_code == 200 and data.get("success") and data.get("result", {}).get("image"):
-                    jpeg_bytes = base64.b64decode(data["result"]["image"])
-                    # Cloudflare always returns JPEG — convert to PNG for consistency.
-                    img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
-
-                    # ── 9:16 safety net ──────────────────────────────────────────
-                    # If the API ignored our width/height and returned a square
-                    # (shouldn't happen with Leonardo, but guards against surprises),
-                    # force the image to the requested 9:16 dimensions:
-                    #   • Too wide → centre-crop horizontally
-                    #   • Too tall  → centre-crop vertically
-                    #   • Wrong size entirely → resize to target
-                    if width and height and img.size != (width, height):
-                        target_ratio = width / height
-                        src_w, src_h = img.size
-                        src_ratio = src_w / src_h
-                        if abs(src_ratio - target_ratio) > 0.01:
-                            # Need to crop to match aspect ratio first
-                            if src_ratio > target_ratio:
-                                # Image is wider than needed — crop sides
-                                new_w = int(src_h * target_ratio)
-                                left = (src_w - new_w) // 2
-                                img = img.crop((left, 0, left + new_w, src_h))
-                            else:
-                                # Image is taller than needed — crop top/bottom
-                                new_h = int(src_w / target_ratio)
-                                top = (src_h - new_h) // 2
-                                img = img.crop((0, top, src_w, top + new_h))
-                        # Final resize to exact target resolution
-                        img = img.resize((width, height), Image.LANCZOS)
-                    # ─────────────────────────────────────────────────────────────
-
-                    png_buf = io.BytesIO()
-                    img.save(png_buf, format="PNG")
-                    return png_buf.getvalue()
-                errors = data.get("errors") or [{"message": resp.text[:200]}]
-                last_error = "; ".join(e.get("message", str(e)) for e in errors)
+                response = openai_client.images.generate(
+                    model="gpt-image-1",
+                    prompt=prompt,
+                    n=1,
+                    size="1024x1792",   # native 9:16 — no cropping needed
+                    quality=quality,
+                )
+                # gpt-image-1 returns base64 by default
+                b64 = response.data[0].b64_json
+                img_bytes = base64.b64decode(b64)
+                # Verify & ensure exact 9:16 just in case
+                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                img = ensure_9x16(img, 1024, 1792)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                return buf.getvalue()
             except Exception as e:
-                last_error = str(e)
-            if attempt < retries:
-                time.sleep(5)
-        raise RuntimeError(last_error or "Unknown error generating image")
+                last_err = str(e)
+                if attempt < max_retries:
+                    time.sleep(5)
+        raise RuntimeError(last_err or "Unknown OpenAI error")
 
     if st.button("🖼️ Generate all scene images", type="primary", key="step1_generate_btn"):
         progress = st.progress(0.0)
@@ -300,110 +246,92 @@ def render_step1():
         results = []
         image_bufs = {}
 
-        total = len(df)
         for i, row in df.iterrows():
             scene_id = str(row["id"])
             prompt = f"{str(row['image_prompt']).strip()}, {style_suffix}".strip(", ")
-            status.write(f"Generating {i+1}/{total}: `{scene_id}`")
+            status.write(f"Generating {i+1}/{n}: `{scene_id}`")
             try:
-                img_bytes = generate_image(
-                    prompt, model_id, steps, max_retries, width=img_width, height=img_height
-                )
+                img_bytes = generate_image_openai(prompt)
                 fname = f"{safe_name(scene_id)}.png"
                 image_bufs[scene_id] = (fname, img_bytes)
-                results.append({"id": scene_id, "image_prompt": prompt, "status": "✅ Success"})
+                results.append({"id": scene_id, "status": "✅ OK", "prompt": prompt})
             except Exception as e:
-                results.append({"id": scene_id, "image_prompt": prompt, "status": f"❌ {e}"})
-            progress.progress((i + 1) / total)
-            if pace_delay > 0 and i < total - 1:
+                results.append({"id": scene_id, "status": f"❌ {e}", "prompt": prompt})
+            progress.progress((i + 1) / n)
+            if pace_delay > 0 and i < n - 1:
                 time.sleep(pace_delay)
 
         results_df = pd.DataFrame(results)
-        st.subheader("Per-scene results")
+        st.subheader("Results")
         st.dataframe(results_df, use_container_width=True)
 
-        n_ok = (results_df["status"] == "✅ Success").sum()
-        st.success(f"{n_ok}/{total} images generated successfully.")
+        n_ok = (results_df["status"] == "✅ OK").sum()
+        st.success(f"{n_ok}/{n} images generated.")
 
         if n_ok == 0:
-            st.error(
-                "No images succeeded — check the error messages in the table above. "
-                "Common causes: an invalid CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN "
-                "(double-check both in your secrets), the API token missing 'Workers AI' "
-                "permissions, or you've used up today's free 10,000-Neuron allowance "
-                "(resets daily at 00:00 UTC)."
-            )
+            st.error("No images succeeded. Check the errors above and your API key/billing.")
             return
 
-        # Save into shared session state so Step 2 can pick these up automatically
+        # Store in session state → Step 2 picks them up automatically
         st.session_state.generated_images = image_bufs
         st.session_state.generated_images_log = results_df
 
+        # Preview
         st.subheader("Preview")
-        preview_cols = st.columns(4)
-        for idx, (scene_id, (fname, img_bytes)) in enumerate(list(image_bufs.items())[:8]):
-            with preview_cols[idx % 4]:
-                st.image(img_bytes, caption=scene_id, use_container_width=True)
+        cols = st.columns(4)
+        for idx, (sid, (fname, ibytes)) in enumerate(list(image_bufs.items())[:8]):
+            with cols[idx % 4]:
+                st.image(ibytes, caption=sid, use_container_width=True)
 
-        st.success("✅ Images are ready — switch to the **Step 2** tab above to continue, no need to download/re-upload.")
-
+        # Download ZIP
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for scene_id, (fname, img_bytes) in image_bufs.items():
-                zf.writestr(fname, img_bytes)
+            for sid, (fname, ibytes) in image_bufs.items():
+                zf.writestr(fname, ibytes)
         zip_buf.seek(0)
 
         st.download_button(
-            "⬇️ Download scene images (.zip) — optional, for backup",
+            "⬇️ Download all images (.zip)",
             data=zip_buf.getvalue(),
             file_name=f"{project_id_step1}.zip",
             mime="application/zip",
             key="step1_zip_dl",
         )
 
-        log_buf = io.BytesIO()
-        results_df.to_excel(log_buf, index=False)
-        st.download_button(
-            "⬇️ Download generation log (.xlsx)",
-            data=log_buf.getvalue(),
-            file_name=f"{project_id_step1}_log.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="step1_log_dl",
+        st.success(
+            "✅ Images ready — switch to **② Assemble Video** tab. "
+            "They are already loaded; no need to re-upload."
         )
 
 
-# ---------------------------------------------------------------------------
-# Step 2: Shorts Assembler (ElevenLabs voice + pan/zoom + music)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# STEP 2 — Assemble Video (ElevenLabs voice + pan/zoom + music)
+# ===========================================================================
 def render_step2():
     st.header("🎬 Step 2: Assemble Voiced Video")
     st.caption(
-        "Uses images from Step 1 (or an uploaded ZIP) + narration script (Excel) → "
-        "ElevenLabs voiceover + pan/zoom motion + background music + stitched final video"
+        "Images → ElevenLabs voiceover → pan/zoom clips → background music → final Short"
     )
 
     if "ELEVENLABS_API_KEY" not in st.secrets:
-        st.error(
-            "Missing required secret: ELEVENLABS_API_KEY. "
-            "Add it under App Settings → Secrets (Streamlit Cloud) "
-            "or .streamlit/secrets.toml (local)."
-        )
+        st.error("Missing secret: ELEVENLABS_API_KEY. Add it to your secrets.")
         return
 
-    client = ElevenLabs(api_key=st.secrets["ELEVENLABS_API_KEY"])
+    el_client = ElevenLabs(api_key=st.secrets["ELEVENLABS_API_KEY"])
 
+    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.subheader("Step 2 settings")
+        st.subheader("Step 2 — Video settings")
 
         @st.cache_data(ttl=3600)
         def get_voices():
-            resp = client.voices.get_all()
+            resp = el_client.voices.get_all()
             return {v.name: v.voice_id for v in resp.voices}
 
         try:
             voice_options = get_voices()
         except Exception as e:
-            st.error(f"Could not load voices from ElevenLabs: {e}")
+            st.error(f"Could not load ElevenLabs voices: {e}")
             return
 
         voice_name = st.selectbox("Narrator voice", list(voice_options.keys()), key="step2_voice")
@@ -413,10 +341,7 @@ def render_step2():
             "ElevenLabs model",
             ["eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_turbo_v2_5"],
             index=0,
-            help=(
-                "Flash v2.5 is cheapest and English-focused. For Hindi or other "
-                "non-English scripts, use eleven_multilingual_v2."
-            ),
+            help="Flash v2.5 = cheapest, English. For Hindi/other languages use multilingual_v2.",
             key="step2_tts_model",
         )
 
@@ -428,15 +353,8 @@ def render_step2():
         st.subheader("Background music")
         enable_music = st.checkbox("Add background music", value=True, key="step2_music_enable")
         music_target_lufs = st.slider(
-            "Music level under narration (LUFS)", -40, -20, -30,
-            help=(
-                "How loud the music sits relative to the voice, auto-normalized. "
-                "Each track is measured first, then adjusted to this exact target — "
-                "so quiet and loud source tracks all end up consistently leveled, "
-                "instead of a flat dB cut that sounds different per track. "
-                "-30 LUFS is a safe 'clearly under the voice' default; raise toward "
-                "-24 for music that's more present, lower toward -36 for near-silent."
-            ),
+            "Music level (LUFS)", -40, -20, -30,
+            help="-30 = clearly under voice. Higher = more present music.",
             disabled=not enable_music,
             key="step2_music_lufs",
         )
@@ -445,50 +363,66 @@ def render_step2():
             ["Auto-detect from script", "Force: upbeat", "Force: dramatic", "Force: calm"],
             index=0,
             disabled=not enable_music,
-            help="Auto-detect scores your script's words against mood keyword lists.",
             key="step2_music_mood",
         )
 
         project_id = st.text_input(
             "Project ID",
             value=datetime.now().strftime("short_%Y%m%d_%H%M%S"),
-            help="Used as the output filename prefix.",
             key="step2_project_id",
         )
 
-    # -----------------------------------------------------------------
-    # Image source: auto-use Step 1 output if present, else allow ZIP upload
-    # -----------------------------------------------------------------
+    # ── Image source: two clear paths ─────────────────────────────────────────
+    st.subheader("📁 Image source")
+
     images_from_step1 = st.session_state.generated_images
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if images_from_step1:
-            st.success(f"✅ Using {len(images_from_step1)} image(s) generated in Step 1.")
-            use_uploaded_zip = st.checkbox(
-                "Use a different ZIP instead of Step 1 images", value=False, key="step2_override_zip"
-            )
-            images_zip = None
-            if use_uploaded_zip:
-                images_zip = st.file_uploader("Scene images (.zip)", type=["zip"], key="step2_zip_upload")
-        else:
-            st.info("No images from Step 1 yet — upload a ZIP, or go to Step 1 first.")
-            images_zip = st.file_uploader("Scene images (.zip)", type=["zip"], key="step2_zip_upload_only")
-            use_uploaded_zip = images_zip is not None
+    source_options = ["Use images from Step 1 (already loaded)", "Upload a ZIP of pre-made images"]
+    if not images_from_step1:
+        # Force zip upload if Step 1 hasn't run
+        source_choice = "Upload a ZIP of pre-made images"
+        st.info("No images from Step 1 yet — please upload a ZIP of your images below.")
+    else:
+        source_choice = st.radio(
+            "Where are your images coming from?",
+            source_options,
+            index=0,
+            key="step2_source_radio",
+            help=(
+                "**Step 1 images** — generated moments ago in this session, loaded automatically.\n\n"
+                "**Upload ZIP** — images you already have on disk, named `<id>.png` to match your Excel."
+            ),
+        )
 
-    with col2:
-        script_file = st.file_uploader("Narration script (.xlsx)", type=["xlsx", "xls"], key="step2_script_upload")
+    images_zip = None
+    if source_choice == "Upload a ZIP of pre-made images":
+        st.markdown(
+            "**Naming rule:** each image filename must match the `id` in your Excel exactly. "
+            "Example: if your Excel row has `id = scene_01`, the file must be `scene_01.png` (or .jpg). "
+            "The **order in the Excel** controls the scene sequence in the final video."
+        )
+        images_zip = st.file_uploader(
+            "Scene images (.zip)",
+            type=["zip"],
+            key="step2_zip_upload",
+        )
+        if not images_zip:
+            st.info("Upload your ZIP to continue.")
+            return
 
-    st.caption(
-        "Excel needs columns: **id** (matches image filenames), "
-        "**script_text** (the narration line for that scene)."
+    # ── Narration script ──────────────────────────────────────────────────────
+    st.subheader("📝 Narration script")
+    script_file = st.file_uploader(
+        "Narration Excel (.xlsx) — columns: id · script_text",
+        type=["xlsx", "xls"],
+        key="step2_script_upload",
     )
 
     if not script_file:
         st.info("Upload your narration Excel to continue.")
-        if st.button("Generate sample script template", key="step2_sample_btn"):
+        if st.button("Download sample script template", key="step2_sample_btn"):
             sample = pd.DataFrame({
-                "id": ["wc1983_01", "wc1983_02", "wc1983_03"],
+                "id": ["scene_01", "scene_02", "scene_03"],
                 "script_text": [
                     "In 1983, nobody expected India to win the World Cup.",
                     "The team walked onto the field at Lord's, underdogs once again.",
@@ -498,7 +432,7 @@ def render_step2():
             buf = io.BytesIO()
             sample.to_excel(buf, index=False)
             st.download_button(
-                "Download template.xlsx",
+                "⬇️ script_template.xlsx",
                 data=buf.getvalue(),
                 file_name="script_template.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -506,38 +440,31 @@ def render_step2():
             )
         return
 
-    if not images_from_step1 and not images_zip:
-        st.info("Provide images — either generate them in Step 1, or upload a ZIP above.")
-        return
-
     try:
         script_df = pd.read_excel(script_file)
     except Exception as e:
-        st.error(f"Could not read the script Excel file: {e}")
+        st.error(f"Could not read script Excel: {e}")
         return
 
     script_df.columns = [str(c).strip().lower() for c in script_df.columns]
     if "id" not in script_df.columns or "script_text" not in script_df.columns:
-        st.error("Script Excel must have columns named 'id' and 'script_text'.")
+        st.error("Script Excel must have columns: id · script_text")
         return
 
     script_df = script_df[script_df["script_text"].notna()].reset_index(drop=True)
 
+    # ── Extract images to disk ─────────────────────────────────────────────────
     work_dir = tempfile.mkdtemp(prefix="shorts_")
     images_dir = os.path.join(work_dir, "images")
     os.makedirs(images_dir, exist_ok=True)
 
-    # Write images to disk, either from Step 1's in-memory dict or an uploaded ZIP
-    if images_from_step1 and not use_uploaded_zip:
-        for scene_id, (fname, img_bytes) in images_from_step1.items():
+    if source_choice == "Use images from Step 1 (already loaded)":
+        for sid, (fname, ibytes) in images_from_step1.items():
             with open(os.path.join(images_dir, fname), "wb") as f:
-                f.write(img_bytes)
-    elif images_zip:
+                f.write(ibytes)
+    else:
         with zipfile.ZipFile(images_zip) as zf:
             zf.extractall(images_dir)
-    else:
-        st.error("No image source available.")
-        return
 
     image_files = []
     for root, _, files in os.walk(images_dir):
@@ -545,44 +472,47 @@ def render_step2():
             if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
                 image_files.append(os.path.join(root, f))
 
-    def find_image_for_id(scene_id: str):
-        scene_id = str(scene_id).strip()
+    def find_image(scene_id: str):
+        sid = str(scene_id).strip()
         for path in image_files:
             stem = os.path.splitext(os.path.basename(path))[0]
-            if stem == scene_id:
+            if stem == sid:
                 return path
+        # Fuzzy fallback: prefix match
         for path in image_files:
             stem = os.path.splitext(os.path.basename(path))[0]
-            if stem.startswith(scene_id + "_") or stem.startswith(scene_id + "-"):
+            if stem.startswith(sid + "_") or stem.startswith(sid + "-"):
                 return path
         return None
 
-    script_df["image_path"] = script_df["id"].apply(find_image_for_id)
+    script_df["image_path"] = script_df["id"].apply(find_image)
     missing = script_df[script_df["image_path"].isna()]
 
-    st.success(f"Loaded {len(script_df)} scene(s) from script.")
-    if len(missing) > 0:
-        st.warning(
-            f"{len(missing)} scene id(s) have no matching image and will be skipped: "
-            f"{', '.join(missing['id'].astype(str).tolist())}"
-        )
-
+    st.subheader("Scene matching")
     preview_df = script_df[["id", "script_text", "image_path"]].copy()
     preview_df["image_path"] = preview_df["image_path"].apply(
-        lambda p: os.path.basename(p) if isinstance(p, str) else "❌ not found"
+        lambda p: f"✅ {os.path.basename(p)}" if isinstance(p, str) else "❌ not found"
     )
     st.dataframe(preview_df, use_container_width=True)
 
-    valid_df = script_df[script_df["image_path"].notna()].reset_index(drop=True)
+    if len(missing) > 0:
+        st.warning(
+            f"{len(missing)} scene(s) have no matching image and will be skipped: "
+            f"{', '.join(missing['id'].astype(str).tolist())}"
+        )
 
-    def generate_voiceover(text: str, out_path: str, max_retries: int = 2):
-        last_error = None
-        for attempt in range(max_retries + 1):
+    valid_df = script_df[script_df["image_path"].notna()].reset_index(drop=True)
+    if valid_df.empty:
+        st.error("No matched scenes to process.")
+        return
+
+    # ── ffmpeg helpers ────────────────────────────────────────────────────────
+    def generate_voiceover(text: str, out_path: str):
+        last_err = None
+        for attempt in range(3):
             try:
-                audio_iter = client.text_to_speech.convert(
-                    voice_id=voice_id,
-                    text=text,
-                    model_id=tts_model,
+                audio_iter = el_client.text_to_speech.convert(
+                    voice_id=voice_id, text=text, model_id=tts_model,
                     output_format="mp3_44100_128",
                 )
                 with open(out_path, "wb") as f:
@@ -590,29 +520,26 @@ def render_step2():
                         f.write(chunk)
                 return
             except Exception as e:
-                last_error = e
-                if attempt < max_retries:
+                last_err = e
+                if attempt < 2:
                     time.sleep(3)
-        raise last_error
+        raise last_err
 
-    def get_audio_duration(path: str) -> float:
-        result = subprocess.run(
+    def get_duration(path: str) -> float:
+        r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, check=True,
         )
-        return float(result.stdout.strip())
+        return float(r.stdout.strip())
 
-    def make_panzoom_clip(image_path: str, duration: float, out_path: str, zoom_in: bool = True):
+    def make_panzoom_clip(image_path: str, duration: float, out_path: str, zoom_in: bool):
         fps = 25
-        total_frames = max(int(duration * fps), 1)
-        if zoom_in:
-            zoom_expr = "min(zoom+0.0015,1.3)"
-        else:
-            zoom_expr = "if(eq(on,1),1.3,max(zoom-0.0015,1.0))"
+        frames = max(int(duration * fps), 1)
+        zoom_expr = "min(zoom+0.0015,1.3)" if zoom_in else "if(eq(on,1),1.3,max(zoom-0.0015,1.0))"
         vf = (
             f"scale=2160:3840,"
-            f"zoompan=z='{zoom_expr}':d={total_frames}:"
+            f"zoompan=z='{zoom_expr}':d={frames}:"
             f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps={fps}"
         )
         subprocess.run(
@@ -621,147 +548,104 @@ def render_step2():
             capture_output=True, check=True,
         )
 
-    def mux_video_audio(video_path: str, audio_path: str, out_path: str):
+    def mux(video: str, audio: str, out: str):
         subprocess.run(
-            ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
-             "-c:v", "copy", "-c:a", "aac", "-shortest", out_path],
+            ["ffmpeg", "-y", "-i", video, "-i", audio,
+             "-c:v", "copy", "-c:a", "aac", "-shortest", out],
             capture_output=True, check=True,
         )
 
-    def concat_clips(clip_paths: list, out_path: str):
+    def concat(clips: list, out: str):
         list_file = os.path.join(work_dir, "concat_list.txt")
         with open(list_file, "w") as f:
-            for p in clip_paths:
+            for p in clips:
                 f.write(f"file '{p}'\n")
         subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
-             "-c", "copy", out_path],
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", out],
             capture_output=True, check=True,
         )
 
-    def get_video_duration(path: str) -> float:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, check=True,
-        )
-        return float(result.stdout.strip())
-
-    def mix_background_music(video_in_path: str, music_path: str, out_path: str, target_lufs: int):
-        """
-        Auto-normalizes the music track to a consistent loudness (LUFS) before
-        mixing, instead of applying a flat dB cut. This means a quietly-mastered
-        track and a loudly-mastered track both end up at the same perceived
-        loudness under the narration, rather than one sounding too soft and
-        the other too loud at the same dB setting.
-
-        loudnorm is a single-pass loudness filter (good enough for background
-        music; the alternative two-pass mode needs an extra analysis run and
-        isn't necessary for this use case).
-        """
-        duration = get_video_duration(video_in_path)
-        filter_complex = (
-            f"[1:a]loudnorm=I={target_lufs}:TP=-2:LRA=11[music];"
+    def mix_music(video_in: str, music: str, out: str, lufs: int):
+        duration = get_duration(video_in)
+        fc = (
+            f"[1:a]loudnorm=I={lufs}:TP=-2:LRA=11[music];"
             f"[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
         )
         subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", video_in_path,
-                "-stream_loop", "-1", "-i", music_path,
-                "-filter_complex", filter_complex,
-                "-map", "0:v", "-map", "[aout]",
-                "-c:v", "copy", "-c:a", "aac",
-                "-t", str(duration),
-                out_path,
-            ],
+            ["ffmpeg", "-y", "-i", video_in, "-stream_loop", "-1", "-i", music,
+             "-filter_complex", fc, "-map", "0:v", "-map", "[aout]",
+             "-c:v", "copy", "-c:a", "aac", "-t", str(duration), out],
             capture_output=True, check=True,
         )
 
-    if st.button("🎬 Generate voiceover + video for all scenes", type="primary", key="step2_generate_btn"):
+    # ── Main generate button ──────────────────────────────────────────────────
+    if st.button("🎬 Generate voiceover + video", type="primary", key="step2_generate_btn"):
         progress = st.progress(0.0)
         status = st.empty()
         results = []
         clip_paths = []
-
         total = len(valid_df)
+        zoom_in = zoom_direction == "Slow zoom in"
+
         for i, row in valid_df.iterrows():
-            scene_id = str(row["id"])
+            sid = str(row["id"])
             text = str(row["script_text"]).strip()
             img_path = row["image_path"]
-            status.write(f"Processing {i+1}/{total}: `{scene_id}`")
+            status.write(f"Processing {i+1}/{total}: `{sid}`")
 
-            audio_path = os.path.join(work_dir, f"{safe_name(scene_id)}.mp3")
-            video_only_path = os.path.join(work_dir, f"{safe_name(scene_id)}_video.mp4")
-            final_clip_path = os.path.join(work_dir, f"{safe_name(scene_id)}_final.mp4")
+            audio_path = os.path.join(work_dir, f"{safe_name(sid)}.mp3")
+            video_only = os.path.join(work_dir, f"{safe_name(sid)}_video.mp4")
+            clip_final = os.path.join(work_dir, f"{safe_name(sid)}_final.mp4")
 
             try:
                 generate_voiceover(text, audio_path)
-                duration = get_audio_duration(audio_path)
-                make_panzoom_clip(
-                    img_path, duration, video_only_path,
-                    zoom_in=(zoom_direction == "Slow zoom in"),
-                )
-                mux_video_audio(video_only_path, audio_path, final_clip_path)
-                clip_paths.append(final_clip_path)
-                results.append({
-                    "id": scene_id, "script_text": text,
-                    "duration_sec": round(duration, 2), "status": "✅ Success",
-                })
+                dur = get_duration(audio_path)
+                make_panzoom_clip(img_path, dur, video_only, zoom_in)
+                mux(video_only, audio_path, clip_final)
+                clip_paths.append(clip_final)
+                results.append({"id": sid, "script_text": text, "duration_sec": round(dur, 2), "status": "✅ OK"})
             except Exception as e:
-                results.append({
-                    "id": scene_id, "script_text": text,
-                    "duration_sec": None, "status": f"❌ {e}",
-                })
+                results.append({"id": sid, "script_text": text, "duration_sec": None, "status": f"❌ {e}"})
 
             progress.progress((i + 1) / total)
 
-        status.write("Stitching final video...")
         results_df = pd.DataFrame(results)
         st.subheader("Per-scene results")
         st.dataframe(results_df, use_container_width=True)
 
-        n_ok = (results_df["status"] == "✅ Success").sum()
-        st.success(f"{n_ok}/{total} scenes processed successfully.")
+        n_ok = (results_df["status"] == "✅ OK").sum()
+        st.success(f"{n_ok}/{total} scenes processed.")
 
-        if len(clip_paths) == 0:
+        if not clip_paths:
             st.error("No scenes succeeded — nothing to stitch.")
             return
 
-        final_output_path = os.path.join(work_dir, f"{project_id}.mp4")
+        status.write("Stitching scenes together...")
+        final_path = os.path.join(work_dir, f"{project_id}.mp4")
         try:
-            concat_clips(clip_paths, final_output_path)
-            status.write("Stitching done.")
+            concat(clip_paths, final_path)
 
-            music_used = None
             if enable_music:
-                if music_override == "Auto-detect from script":
-                    full_text = " ".join(valid_df["script_text"].astype(str).tolist())
-                    mood = classify_mood(full_text)
-                else:
-                    mood = music_override.replace("Force: ", "")
-
-                music_path = pick_music_track(mood, MUSIC_DIR)
-                if music_path is None:
+                mood = (
+                    classify_mood(" ".join(valid_df["script_text"].astype(str)))
+                    if music_override == "Auto-detect from script"
+                    else music_override.replace("Force: ", "")
+                )
+                music_track = pick_music_track(mood, MUSIC_DIR)
+                if music_track is None:
                     st.warning(
-                        f"No music files found for mood '{mood}' in `music/{mood}/` — "
-                        "skipping background music. Add .mp3 files to that folder to enable it."
+                        f"No music files found for mood '{mood}' in music/{mood}/ — skipping. "
+                        "Add .mp3 files to that folder to enable background music."
                     )
                 else:
                     status.write(f"Adding background music (mood: {mood})...")
-                    with_music_path = os.path.join(work_dir, f"{project_id}_with_music.mp4")
-                    mix_background_music(
-                        final_output_path, music_path, with_music_path, music_target_lufs
-                    )
-                    final_output_path = with_music_path
-                    music_used = {"mood": mood, "track": os.path.basename(music_path)}
+                    with_music = os.path.join(work_dir, f"{project_id}_with_music.mp4")
+                    mix_music(final_path, music_track, with_music, music_target_lufs)
+                    final_path = with_music
+                    st.info(f"🎵 Music: **{os.path.basename(music_track)}** (mood: {mood})")
 
-            status.write("Done.")
-
-            if music_used:
-                st.info(f"🎵 Background music: **{music_used['track']}** (mood: {music_used['mood']})")
-
-            with open(final_output_path, "rb") as f:
+            status.write("Done ✅")
+            with open(final_path, "rb") as f:
                 final_bytes = f.read()
 
             st.video(final_bytes)
@@ -782,15 +666,16 @@ def render_step2():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="step2_log_dl",
             )
+
         except subprocess.CalledProcessError as e:
-            st.error(f"Could not stitch final video: {e.stderr.decode() if e.stderr else e}")
+            st.error(f"ffmpeg error: {e.stderr.decode() if e.stderr else e}")
 
 
-# ---------------------------------------------------------------------------
-# Main: tabs
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Main layout
+# ===========================================================================
 st.title("🎬 Shorts Maker")
-st.caption("Excel → AI images → voiced, music-backed vertical video, all in one place.")
+st.caption("Excel → OpenAI images (9:16) → ElevenLabs voice → pan/zoom video → YouTube Short")
 
 tab1, tab2 = st.tabs(["① Generate Images", "② Assemble Video"])
 with tab1:
