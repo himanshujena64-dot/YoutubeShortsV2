@@ -2,7 +2,7 @@
 
 A single Streamlit app with two tabs:
 
-- **① Generate Images** — Excel (with `image_prompt`) → free Hugging Face image generation
+- **① Generate Images** — Excel (with `image_prompt`) → Google Gemini image generation
 - **② Assemble Video** — images + Excel (with `script_text`) → ElevenLabs voiceover + pan/zoom + background music → final MP4
 
 You don't need to download/re-upload anything between the tabs — once you
@@ -20,11 +20,11 @@ directly into Step 2 if you already have images from elsewhere.
 Step 1 reads `id` + `image_prompt`. Step 2 reads `id` + `script_text`
 (same file works for both — just upload it twice, once per tab).
 
-## 1. Get your two API keys (both free to start)
+## 1. Get your two API keys
 
-**Hugging Face** (for images, free):
-1. https://huggingface.co → sign up / log in
-2. https://huggingface.co/settings/tokens → "New token" → role: Read
+**Gemini** (for images — has a free daily quota, then cheap pay-per-image):
+1. https://aistudio.google.com/apikey → sign in with a Google account
+2. "Create API key" → copy it
 
 **ElevenLabs** (for voice — you already have this):
 1. https://elevenlabs.io → log in
@@ -34,7 +34,7 @@ Step 1 reads `id` + `image_prompt`. Step 2 reads `id` + `script_text`
 
 Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`:
 ```toml
-HF_API_TOKEN = "hf_your_real_token"
+GEMINI_API_KEY = "your_real_gemini_api_key"
 ELEVENLABS_API_KEY = "your_real_elevenlabs_key"
 ```
 
@@ -70,7 +70,7 @@ Requires `ffmpeg` installed locally (`apt install ffmpeg` / `brew install ffmpeg
 1. Push this **entire folder** to a single GitHub repo — including
    `packages.txt` (installs ffmpeg) and the `music/` folder with your tracks.
 2. share.streamlit.io → New app → this repo → main file `app.py`
-3. App Settings → Secrets → paste both `HF_API_TOKEN` and `ELEVENLABS_API_KEY`
+3. App Settings → Secrets → paste both `GEMINI_API_KEY` and `ELEVENLABS_API_KEY`
 4. Deploy — you get **one URL** for the whole tool.
 
 ## How to use it, step by step
@@ -78,20 +78,41 @@ Requires `ffmpeg` installed locally (`apt install ffmpeg` / `brew install ffmpeg
 1. Open the app → you'll see two tabs at the top: **① Generate Images** and
    **② Assemble Video**
 2. In tab ①: upload your Excel, click "Generate all scene images", wait
-   (free tier can be slow — be patient, it retries automatically)
+   (it paces itself between requests to respect the free-tier rate limit)
 3. Click over to tab ②: your images are already there. Upload your Excel
    again (same file, or a different one if you only changed wording),
    pick a voice, leave music on auto, click "Generate voiceover + video"
 4. Download your finished `.mp4`
 
+## Cost reality, honestly
+
+- **Gemini free tier**: a daily quota exists for `gemini-2.5-flash-image`,
+  but it's rate-limited (a few images per minute, not unlimited). A 15-25
+  scene Short generally fits within free daily limits if you're not also
+  running other batches that day.
+- **If you exceed free quota or want higher quality**: Gemini bills per
+  image — roughly **$0.02–$0.04 per image** on `gemini-2.5-flash-image`,
+  more on `gemini-3-pro-image-preview` (Nano Banana Pro). A 20-scene Short
+  would cost roughly $0.40–$0.80 even fully paid — cheap, but not zero.
+  Enable billing in [Google AI Studio](https://aistudio.google.com) if you
+  want to remove the daily cap entirely.
+- **ElevenLabs**: bills by character — a 90-120 second Short is roughly
+  700-1000 characters, well within Starter plan limits for a handful of
+  Shorts/month.
+
 ## Notes & gotchas
 
-- **If image generation fails with a connection/DNS error or "no provider available"**:
-  Hugging Face's free image API has changed backends before and may again —
-  the app uses their official `huggingface_hub` client with automatic provider
-  routing (not a hardcoded URL) specifically to absorb most such changes, but
-  if a *specific model* stops being served for free, switch to a different
-  model in the sidebar dropdown rather than waiting for it to come back.
+- **If image generation fails with a quota/429 error**: you've hit the free
+  daily rate limit. Either wait (quotas reset daily), space out your batches,
+  or enable billing in AI Studio to remove the cap.
+- **If a specific prompt returns "No image data in response"**: Gemini's
+  safety filters likely blocked that specific prompt. Try rewording it to be
+  less ambiguous or less likely to trigger a safety filter (e.g. avoid
+  prompts that could be read as depicting real identifiable people, graphic
+  violence, or other sensitive content).
+- **All Gemini-generated images include an invisible SynthID watermark** —
+  this is standard for all Gemini image output and isn't something this app
+  can disable.
 - **Music levels auto-normalize**: instead of a flat volume cut, each music
   track is measured and adjusted to a consistent loudness (LUFS) before
   mixing under the narration. This means quiet-mastered and loud-mastered
@@ -110,9 +131,9 @@ Requires `ffmpeg` installed locally (`apt install ffmpeg` / `brew install ffmpeg
   commercial use / YouTube monetization.
 - **Commercial rights (music)**: stick to Pixabay Music / YouTube Audio
   Library — sources explicitly cleared for monetized use.
-- **Cost**: Hugging Face Step 1 is free (slower, less reliable). ElevenLabs
-  Step 2 bills by character — a 90-120 second Short is roughly 700-1000
-  characters, well within Starter plan limits for a handful of Shorts/month.
+- **Commercial rights (images)**: Google's terms permit commercial use of
+  Gemini-generated images — check Google's current terms of service for your
+  specific use case before relying on this for monetized content.
 - **Filename matching**: if a scene's `id` doesn't match any image filename,
   that scene is skipped (shown as a warning) rather than breaking the batch.
 - **Processing time**: each scene takes a few seconds in both steps; a

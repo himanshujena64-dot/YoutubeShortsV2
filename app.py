@@ -12,7 +12,8 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 from elevenlabs.client import ElevenLabs
-from huggingface_hub import InferenceClient as HFInferenceClient
+from google import genai
+from google.genai import types
 
 st.set_page_config(page_title="Shorts Maker", page_icon="🎬", layout="wide")
 
@@ -78,42 +79,39 @@ def safe_name(s: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Image Generator (Hugging Face, free)
+# Step 1: Image Generator (Google Gemini)
 # ---------------------------------------------------------------------------
 def render_step1():
     st.header("🖼️ Step 1: Generate Scene Images")
     st.caption(
         "Upload one Excel with id, script_text, image_prompt → "
-        "free Hugging Face image generation → images ready for Step 2"
+        "Google Gemini image generation → images ready for Step 2"
     )
 
-    if "HF_API_TOKEN" not in st.secrets:
+    if "GEMINI_API_KEY" not in st.secrets:
         st.error(
-            "Missing required secret: HF_API_TOKEN. "
+            "Missing required secret: GEMINI_API_KEY. "
             "Add it under App Settings → Secrets (Streamlit Cloud) "
             "or .streamlit/secrets.toml (local). "
-            "Get a free token at https://huggingface.co/settings/tokens"
+            "Get a free key at https://aistudio.google.com/apikey"
         )
         return
 
-    HF_TOKEN = st.secrets["HF_API_TOKEN"]
-    hf_client = HFInferenceClient(api_key=HF_TOKEN, provider="auto")
+    gemini_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
     with st.sidebar:
         st.subheader("Step 1 settings")
         model_id = st.selectbox(
-            "Hugging Face model",
+            "Gemini image model",
             [
-                "black-forest-labs/FLUX.1-schnell",
-                "black-forest-labs/FLUX.1-dev",
-                "stabilityai/stable-diffusion-3.5-large-turbo",
+                "gemini-2.5-flash-image",
+                "gemini-3-pro-image-preview",
             ],
             index=0,
             help=(
-                "Models currently routed through Hugging Face's Inference Providers "
-                "(provider=auto picks whichever backend is available). FLUX.1-schnell "
-                "is fastest and a good free default — if one model errors or times out "
-                "repeatedly, try another from this list."
+                "gemini-2.5-flash-image (Nano Banana) is fast and has a free daily "
+                "quota — good default. gemini-3-pro-image-preview (Nano Banana Pro) "
+                "is higher quality but costs more per image and has no free tier."
             ),
             key="step1_model",
         )
@@ -125,14 +123,22 @@ def render_step1():
         )
         aspect = st.selectbox(
             "Aspect ratio",
-            ["Vertical (1080x1920, for Shorts)", "Square (1024x1024)"],
+            ["Vertical (9:16, for Shorts)", "Square (1:1)"],
             index=0,
             key="step1_aspect",
         )
-        width, height = (768, 1344) if aspect.startswith("Vertical") else (1024, 1024)
+        aspect_ratio_value = "9:16" if aspect.startswith("Vertical") else "1:1"
+        pace_delay = st.slider(
+            "Delay between images (seconds)", 0, 10, 3,
+            help=(
+                "Free tier is rate-limited to a few images per minute. A small delay "
+                "between requests avoids hitting that limit mid-batch."
+            ),
+            key="step1_pace_delay",
+        )
         max_retries = st.slider(
             "Retries per image on failure", 0, 5, 2,
-            help="Free HF endpoints can be slow to 'wake up' or briefly overloaded. Retrying helps.",
+            help="Helps absorb brief rate-limit or transient errors.",
             key="step1_retries",
         )
         project_id_step1 = st.text_input(
@@ -194,16 +200,22 @@ def render_step1():
     st.success(f"Loaded {len(df)} scene(s).")
     st.dataframe(df[["id", "script_text", "image_prompt"]], use_container_width=True)
 
-    def generate_image(prompt: str, model: str, w: int, h: int, retries: int) -> bytes:
+    def generate_image(prompt: str, model: str, aspect_ratio: str, retries: int) -> bytes:
         last_error = None
         for attempt in range(retries + 1):
             try:
-                pil_image = hf_client.text_to_image(
-                    prompt, model=model, width=w, height=h,
+                response = gemini_client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                        image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
+                    ),
                 )
-                buf = io.BytesIO()
-                pil_image.save(buf, format="PNG")
-                return buf.getvalue()
+                for part in response.parts:
+                    if part.inline_data:
+                        return part.inline_data.data
+                last_error = "No image data in response (possibly blocked by safety filters)"
             except Exception as e:
                 last_error = str(e)
             if attempt < retries:
@@ -222,13 +234,15 @@ def render_step1():
             prompt = f"{str(row['image_prompt']).strip()}, {style_suffix}".strip(", ")
             status.write(f"Generating {i+1}/{total}: `{scene_id}`")
             try:
-                img_bytes = generate_image(prompt, model_id, width, height, max_retries)
+                img_bytes = generate_image(prompt, model_id, aspect_ratio_value, max_retries)
                 fname = f"{safe_name(scene_id)}.png"
                 image_bufs[scene_id] = (fname, img_bytes)
                 results.append({"id": scene_id, "image_prompt": prompt, "status": "✅ Success"})
             except Exception as e:
                 results.append({"id": scene_id, "image_prompt": prompt, "status": f"❌ {e}"})
             progress.progress((i + 1) / total)
+            if pace_delay > 0 and i < total - 1:
+                time.sleep(pace_delay)
 
         results_df = pd.DataFrame(results)
         st.subheader("Per-scene results")
@@ -240,9 +254,9 @@ def render_step1():
         if n_ok == 0:
             st.error(
                 "No images succeeded — check the error messages in the table above. "
-                "Common causes: an invalid/expired HF_API_TOKEN, or the selected model "
-                "currently has no available free provider (try a different model from "
-                "the sidebar dropdown — availability shifts over time)."
+                "Common causes: an invalid GEMINI_API_KEY, exceeded free daily quota "
+                "(wait and retry, or enable billing in AI Studio), or a prompt blocked "
+                "by safety filters."
             )
             return
 
