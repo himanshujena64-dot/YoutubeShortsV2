@@ -2,7 +2,7 @@
 
 A single Streamlit app with two tabs:
 
-- **① Generate Images** — Excel (with `image_prompt`) → Google Gemini image generation
+- **① Generate Images** — Excel (with `image_prompt`) → Cloudflare Workers AI image generation (genuinely free, no billing setup required)
 - **② Assemble Video** — images + Excel (with `script_text`) → ElevenLabs voiceover + pan/zoom + background music → final MP4
 
 You don't need to download/re-upload anything between the tabs — once you
@@ -20,11 +20,15 @@ directly into Step 2 if you already have images from elsewhere.
 Step 1 reads `id` + `image_prompt`. Step 2 reads `id` + `script_text`
 (same file works for both — just upload it twice, once per tab).
 
-## 1. Get your two API keys
+## 1. Get your credentials
 
-**Gemini** (for images — has a free daily quota, then cheap pay-per-image):
-1. https://aistudio.google.com/apikey → sign in with a Google account
-2. "Create API key" → copy it
+**Cloudflare** (for images — free, 10,000 Neurons/day, no card required):
+1. https://dash.cloudflare.com → sign up (free, no credit card)
+2. Click **Workers & Pages** in the left sidebar → click **AI** (or search
+   "Workers AI" in the dashboard)
+3. Click **Use REST API** → **Create a Workers AI API Token** → review →
+   **Create API Token** → copy it (this is `CLOUDFLARE_API_TOKEN`)
+4. On the same page, copy your **Account ID** (this is `CLOUDFLARE_ACCOUNT_ID`)
 
 **ElevenLabs** (for voice — you already have this):
 1. https://elevenlabs.io → log in
@@ -34,12 +38,13 @@ Step 1 reads `id` + `image_prompt`. Step 2 reads `id` + `script_text`
 
 Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`:
 ```toml
-GEMINI_API_KEY = "your_real_gemini_api_key"
+CLOUDFLARE_ACCOUNT_ID = "your_real_account_id"
+CLOUDFLARE_API_TOKEN = "your_real_api_token"
 ELEVENLABS_API_KEY = "your_real_elevenlabs_key"
 ```
 
 **Locally:** stays out of GitHub via `.gitignore`.
-**Streamlit Cloud:** App → Settings → Secrets → paste both lines.
+**Streamlit Cloud:** App → Settings → Secrets → paste all three lines.
 
 ## 3. Set up background music (one-time, ~10 minutes)
 
@@ -70,15 +75,16 @@ Requires `ffmpeg` installed locally (`apt install ffmpeg` / `brew install ffmpeg
 1. Push this **entire folder** to a single GitHub repo — including
    `packages.txt` (installs ffmpeg) and the `music/` folder with your tracks.
 2. share.streamlit.io → New app → this repo → main file `app.py`
-3. App Settings → Secrets → paste both `GEMINI_API_KEY` and `ELEVENLABS_API_KEY`
+3. App Settings → Secrets → paste `CLOUDFLARE_ACCOUNT_ID`,
+   `CLOUDFLARE_API_TOKEN`, and `ELEVENLABS_API_KEY`
 4. Deploy — you get **one URL** for the whole tool.
 
 ## How to use it, step by step
 
 1. Open the app → you'll see two tabs at the top: **① Generate Images** and
    **② Assemble Video**
-2. In tab ①: upload your Excel, click "Generate all scene images", wait
-   (it paces itself between requests to respect the free-tier rate limit)
+2. In tab ①: upload your Excel, click "Generate all scene images" — typically
+   fast (a few seconds per image)
 3. Click over to tab ②: your images are already there. Upload your Excel
    again (same file, or a different one if you only changed wording),
    pick a voice, leave music on auto, click "Generate voiceover + video"
@@ -86,33 +92,32 @@ Requires `ffmpeg` installed locally (`apt install ffmpeg` / `brew install ffmpeg
 
 ## Cost reality, honestly
 
-- **Gemini free tier**: a daily quota exists for `gemini-2.5-flash-image`,
-  but it's rate-limited (a few images per minute, not unlimited). A 15-25
-  scene Short generally fits within free daily limits if you're not also
-  running other batches that day.
-- **If you exceed free quota or want higher quality**: Gemini bills per
-  image — roughly **$0.02–$0.04 per image** on `gemini-2.5-flash-image`,
-  more on `gemini-3-pro-image-preview` (Nano Banana Pro). A 20-scene Short
-  would cost roughly $0.40–$0.80 even fully paid — cheap, but not zero.
-  Enable billing in [Google AI Studio](https://aistudio.google.com) if you
-  want to remove the daily cap entirely.
+- **Cloudflare free tier**: 10,000 Neurons/day, no card required, ever, for
+  this tier. `flux-1-schnell` costs roughly 50-80 Neurons per image (varies
+  with steps), so a single account comfortably covers **100+ images per
+  day** for free — several full Shorts worth, every day, indefinitely.
+- **If you exceed 10,000 Neurons/day**: requests simply fail until the reset
+  (00:00 UTC) unless you upgrade to a Workers Paid plan ($0.011/1,000
+  Neurons beyond the free allowance) — for a hobby project this is very
+  unlikely to matter.
 - **ElevenLabs**: bills by character — a 90-120 second Short is roughly
   700-1000 characters, well within Starter plan limits for a handful of
   Shorts/month.
 
 ## Notes & gotchas
 
-- **If image generation fails with a quota/429 error**: you've hit the free
-  daily rate limit. Either wait (quotas reset daily), space out your batches,
-  or enable billing in AI Studio to remove the cap.
-- **If a specific prompt returns "No image data in response"**: Gemini's
-  safety filters likely blocked that specific prompt. Try rewording it to be
-  less ambiguous or less likely to trigger a safety filter (e.g. avoid
-  prompts that could be read as depicting real identifiable people, graphic
-  violence, or other sensitive content).
-- **All Gemini-generated images include an invisible SynthID watermark** —
-  this is standard for all Gemini image output and isn't something this app
-  can disable.
+- **No aspect-ratio control on Step 1's images**: Cloudflare's hosted
+  `flux-1-schnell` only accepts a `prompt` and `steps` parameter — no
+  width/height or aspect-ratio input. Images come back roughly square.
+  This is fine: Step 2's pan/zoom step already scales and crops every image
+  to vertical 9:16 as part of generating the video, so no extra step is
+  needed on your end.
+- **If image generation fails**: double check both `CLOUDFLARE_ACCOUNT_ID`
+  and `CLOUDFLARE_API_TOKEN` are correct, and that the API token has
+  "Workers AI" permissions (the dashboard's "Create a Workers AI API Token"
+  button sets this up correctly automatically). If you've generated a lot of
+  images today, you may have hit the 10,000 Neuron/day free cap — it resets
+  at 00:00 UTC.
 - **Music levels auto-normalize**: instead of a flat volume cut, each music
   track is measured and adjusted to a consistent loudness (LUFS) before
   mixing under the narration. This means quiet-mastered and loud-mastered
@@ -131,9 +136,10 @@ Requires `ffmpeg` installed locally (`apt install ffmpeg` / `brew install ffmpeg
   commercial use / YouTube monetization.
 - **Commercial rights (music)**: stick to Pixabay Music / YouTube Audio
   Library — sources explicitly cleared for monetized use.
-- **Commercial rights (images)**: Google's terms permit commercial use of
-  Gemini-generated images — check Google's current terms of service for your
-  specific use case before relying on this for monetized content.
+- **Commercial rights (images)**: FLUX.1 [schnell] is released under its own
+  license terms (Black Forest Labs) — check the current terms at
+  https://bfl.ai/legal/terms-of-service before relying on this for
+  monetized content.
 - **Filename matching**: if a scene's `id` doesn't match any image filename,
   that scene is skipped (shown as a warning) rather than breaking the batch.
 - **Processing time**: each scene takes a few seconds in both steps; a

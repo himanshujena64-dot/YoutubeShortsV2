@@ -1,3 +1,4 @@
+import base64
 import glob
 import io
 import os
@@ -10,10 +11,9 @@ import zipfile
 from datetime import datetime
 
 import pandas as pd
+import requests
 import streamlit as st
 from elevenlabs.client import ElevenLabs
-from google import genai
-from google.genai import types
 
 st.set_page_config(page_title="Shorts Maker", page_icon="🎬", layout="wide")
 
@@ -79,39 +79,45 @@ def safe_name(s: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Image Generator (Google Gemini)
+# Step 1: Image Generator (Cloudflare Workers AI)
 # ---------------------------------------------------------------------------
 def render_step1():
     st.header("🖼️ Step 1: Generate Scene Images")
     st.caption(
         "Upload one Excel with id, script_text, image_prompt → "
-        "Google Gemini image generation → images ready for Step 2"
+        "Cloudflare Workers AI (free, no billing required) → images ready for Step 2"
     )
 
-    if "GEMINI_API_KEY" not in st.secrets:
+    missing_secrets = [
+        s for s in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN") if s not in st.secrets
+    ]
+    if missing_secrets:
         st.error(
-            "Missing required secret: GEMINI_API_KEY. "
-            "Add it under App Settings → Secrets (Streamlit Cloud) "
+            f"Missing required secret(s): {', '.join(missing_secrets)}. "
+            "Add them under App Settings → Secrets (Streamlit Cloud) "
             "or .streamlit/secrets.toml (local). "
-            "Get a free key at https://aistudio.google.com/apikey"
+            "Get both for free at https://dash.cloudflare.com — no credit card needed. "
+            "See the README for exact steps."
         )
         return
 
-    gemini_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    CF_ACCOUNT_ID = st.secrets["CLOUDFLARE_ACCOUNT_ID"]
+    CF_API_TOKEN = st.secrets["CLOUDFLARE_API_TOKEN"]
 
     with st.sidebar:
         st.subheader("Step 1 settings")
         model_id = st.selectbox(
-            "Gemini image model",
+            "Cloudflare image model",
             [
-                "gemini-2.5-flash-image",
-                "gemini-3-pro-image-preview",
+                "@cf/black-forest-labs/flux-1-schnell",
+                "@cf/leonardo/phoenix-1.0",
+                "@cf/leonardo/lucid-origin",
             ],
             index=0,
             help=(
-                "gemini-2.5-flash-image (Nano Banana) is fast and has a free daily "
-                "quota — good default. gemini-3-pro-image-preview (Nano Banana Pro) "
-                "is higher quality but costs more per image and has no free tier."
+                "flux-1-schnell is fast, cheap (~4-8 Neurons/step), and a good default. "
+                "All run on Cloudflare's free 10,000-Neurons/day allowance — no billing "
+                "needed for typical batch sizes."
             ),
             key="step1_model",
         )
@@ -121,24 +127,27 @@ def render_step1():
             help="Appended to every image_prompt to keep a consistent look across scenes.",
             key="step1_style",
         )
-        aspect = st.selectbox(
-            "Aspect ratio",
-            ["Vertical (9:16, for Shorts)", "Square (1:1)"],
-            index=0,
-            key="step1_aspect",
-        )
-        aspect_ratio_value = "9:16" if aspect.startswith("Vertical") else "1:1"
-        pace_delay = st.slider(
-            "Delay between images (seconds)", 0, 10, 3,
+        steps = st.slider(
+            "Diffusion steps (quality vs. speed/cost)", 1, 8, 4,
             help=(
-                "Free tier is rate-limited to a few images per minute. A small delay "
-                "between requests avoids hitting that limit mid-batch."
+                "Higher = better quality but slower and slightly more Neurons used. "
+                "flux-1-schnell caps at 8. 4 is a good default."
             ),
+            key="step1_steps",
+        )
+        st.caption(
+            "Note: this model generates a fixed square-ish image — there's no "
+            "aspect-ratio control on Cloudflare's hosted version. Step 2's pan/zoom "
+            "already crops/scales images to vertical 9:16, so this works fine as-is."
+        )
+        pace_delay = st.slider(
+            "Delay between images (seconds)", 0, 5, 1,
+            help="A small delay avoids bursty rate-limit errors on larger batches.",
             key="step1_pace_delay",
         )
         max_retries = st.slider(
             "Retries per image on failure", 0, 5, 2,
-            help="Helps absorb brief rate-limit or transient errors.",
+            help="Helps absorb brief transient errors.",
             key="step1_retries",
         )
         project_id_step1 = st.text_input(
@@ -200,26 +209,24 @@ def render_step1():
     st.success(f"Loaded {len(df)} scene(s).")
     st.dataframe(df[["id", "script_text", "image_prompt"]], use_container_width=True)
 
-    def generate_image(prompt: str, model: str, aspect_ratio: str, retries: int) -> bytes:
+    def generate_image(prompt: str, model: str, num_steps: int, retries: int) -> bytes:
+        url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{model}"
+        headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
+        payload = {"prompt": prompt, "steps": num_steps}
+
         last_error = None
         for attempt in range(retries + 1):
             try:
-                response = gemini_client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_modalities=["IMAGE"],
-                        image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
-                    ),
-                )
-                for part in response.parts:
-                    if part.inline_data:
-                        return part.inline_data.data
-                last_error = "No image data in response (possibly blocked by safety filters)"
+                resp = requests.post(url, headers=headers, json=payload, timeout=60)
+                data = resp.json()
+                if resp.status_code == 200 and data.get("success") and data.get("result", {}).get("image"):
+                    return base64.b64decode(data["result"]["image"])
+                errors = data.get("errors") or [{"message": resp.text[:200]}]
+                last_error = "; ".join(e.get("message", str(e)) for e in errors)
             except Exception as e:
                 last_error = str(e)
             if attempt < retries:
-                time.sleep(8)
+                time.sleep(5)
         raise RuntimeError(last_error or "Unknown error generating image")
 
     if st.button("🖼️ Generate all scene images", type="primary", key="step1_generate_btn"):
@@ -234,8 +241,8 @@ def render_step1():
             prompt = f"{str(row['image_prompt']).strip()}, {style_suffix}".strip(", ")
             status.write(f"Generating {i+1}/{total}: `{scene_id}`")
             try:
-                img_bytes = generate_image(prompt, model_id, aspect_ratio_value, max_retries)
-                fname = f"{safe_name(scene_id)}.png"
+                img_bytes = generate_image(prompt, model_id, steps, max_retries)
+                fname = f"{safe_name(scene_id)}.jpg"
                 image_bufs[scene_id] = (fname, img_bytes)
                 results.append({"id": scene_id, "image_prompt": prompt, "status": "✅ Success"})
             except Exception as e:
@@ -254,9 +261,10 @@ def render_step1():
         if n_ok == 0:
             st.error(
                 "No images succeeded — check the error messages in the table above. "
-                "Common causes: an invalid GEMINI_API_KEY, exceeded free daily quota "
-                "(wait and retry, or enable billing in AI Studio), or a prompt blocked "
-                "by safety filters."
+                "Common causes: an invalid CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN "
+                "(double-check both in your secrets), the API token missing 'Workers AI' "
+                "permissions, or you've used up today's free 10,000-Neuron allowance "
+                "(resets daily at 00:00 UTC)."
             )
             return
 
