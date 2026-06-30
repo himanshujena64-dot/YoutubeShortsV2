@@ -322,13 +322,14 @@ def render_step1():
             model="gpt-image-1",
             prompt=prompt,
             n=1,
-            size="1024x1792",
+            size="1024x1536",   # closest portrait size OpenAI supports — cropped to true 9:16 below
             quality=quality,
         )
         b64 = response.data[0].b64_json
         img_bytes = base64.b64decode(b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img = ensure_9x16(img, 1024, 1792)
+        # 1024x1536 is 2:3, not 9:16 — crop/resize to exact 1080x1920 (9:16)
+        img = ensure_9x16(img, 1080, 1920)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
