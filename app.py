@@ -266,33 +266,126 @@ def render_step1():
     st.success(f"Loaded **{n} scene(s)**. Estimated cost: **${est_cost:.3f}**")
     st.dataframe(df[["id", "script_text", "image_prompt"]], use_container_width=True)
 
-    # ── Generation ────────────────────────────────────────────────────────────
-    def generate_image_openai(prompt: str) -> bytes:
-        """Call gpt-image-1 at 1024×1792 (9:16) and return PNG bytes."""
+    # ── Generation helpers ───────────────────────────────────────────────────
+
+    def is_policy_error(err: str) -> bool:
+        """Return True if the error is an OpenAI content policy rejection."""
+        err_lower = err.lower()
+        policy_signals = [
+            "content_policy", "safety system", "content policy",
+            "violates", "rejected", "inappropriate", "unsafe",
+            "content management policy", "policy violation",
+            "your request was rejected", "moderation",
+        ]
+        return any(signal in err_lower for signal in policy_signals)
+
+    def rewrite_prompt_safe(original_prompt: str, scene_context: str) -> str:
+        """Ask GPT-4o-mini to rewrite the prompt to be policy-safe
+        while preserving the visual intent as closely as possible."""
+        system = (
+            "You are an expert at rewriting image generation prompts to comply with "
+            "OpenAI content policies while preserving the original visual intent. "
+            "Rules: Remove or replace anything depicting violence, blood, weapons, "
+            "real people, sensitive political content, or anything that could be flagged. "
+            "Replace with cinematic equivalents — e.g. 'aftermath of battle' instead of "
+            "'soldiers dying', 'determined crowd' instead of 'angry mob with weapons'. "
+            "Keep the mood, setting, and cinematic style. "
+            "Return ONLY the rewritten prompt — no explanation, no quotes, no preamble."
+        )
+        user = (
+            f"Scene context (narration): {scene_context}\n\n"
+            f"Original image prompt that was rejected: {original_prompt}\n\n"
+            "Rewrite this prompt to be fully policy-safe while keeping the same "
+            "visual mood and setting for a YouTube Shorts scene."
+        )
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            max_tokens=200,
+            temperature=0.4,
+        )
+        return resp.choices[0].message.content.strip()
+
+    SAFE_FALLBACK_PROMPTS = [
+        "cinematic aerial view of a vast landscape at golden hour, dramatic clouds, 9:16 vertical",
+        "dramatic close-up of hands holding something meaningful, cinematic lighting, 9:16 vertical",
+        "silhouette of a person standing at the edge of a cliff at sunset, epic, 9:16 vertical",
+        "ancient stone architecture with dramatic shadows and warm light, 9:16 vertical",
+        "vast crowd of people in a stadium, aerial view, dramatic atmosphere, 9:16 vertical",
+        "cinematic shot of a city skyline at dusk, fog and golden light, 9:16 vertical",
+    ]
+
+    def call_openai_image(prompt: str) -> bytes:
+        """Raw OpenAI image API call — returns PNG bytes."""
+        response = openai_client.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            n=1,
+            size="1024x1792",
+            quality=quality,
+        )
+        b64 = response.data[0].b64_json
+        img_bytes = base64.b64decode(b64)
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img = ensure_9x16(img, 1024, 1792)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def generate_image_openai(prompt: str, scene_id: str, script_text: str):
+        """
+        Robust image generation with 3-layer fallback:
+          1. Try original prompt (with retries for transient errors)
+          2. On policy error → GPT rewrites prompt → retry
+          3. If rewrite also fails → use a safe cinematic fallback prompt
+        Returns (png_bytes, final_prompt_used, note)
+        """
+        note = ""
+
+        # ── Layer 1: Try original prompt ──────────────────────────────────────
         last_err = None
         for attempt in range(max_retries + 1):
             try:
-                response = openai_client.images.generate(
-                    model="gpt-image-1",
-                    prompt=prompt,
-                    n=1,
-                    size="1024x1792",   # native 9:16 — no cropping needed
-                    quality=quality,
-                )
-                # gpt-image-1 returns base64 by default
-                b64 = response.data[0].b64_json
-                img_bytes = base64.b64decode(b64)
-                # Verify & ensure exact 9:16 just in case
-                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                img = ensure_9x16(img, 1024, 1792)
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                return buf.getvalue()
+                return call_openai_image(prompt), prompt, note
             except Exception as e:
                 last_err = str(e)
+                if is_policy_error(last_err):
+                    break   # No point retrying same prompt on policy block
                 if attempt < max_retries:
                     time.sleep(5)
-        raise RuntimeError(last_err or "Unknown OpenAI error")
+
+        # ── Layer 2: Policy error → auto-rewrite prompt ───────────────────────
+        if is_policy_error(last_err or ""):
+            note = "⚠️ Original prompt blocked — auto-rewritten for policy compliance"
+            try:
+                safe_prompt = rewrite_prompt_safe(prompt, script_text)
+                safe_prompt_full = f"{safe_prompt}, {style_suffix}".strip(", ")
+                for attempt in range(max_retries + 1):
+                    try:
+                        return call_openai_image(safe_prompt_full), safe_prompt_full, note
+                    except Exception as e2:
+                        rewrite_err = str(e2)
+                        if is_policy_error(rewrite_err):
+                            break
+                        if attempt < max_retries:
+                            time.sleep(5)
+            except Exception:
+                pass   # Rewrite API call itself failed — fall through
+
+        # ── Layer 3: Safe cinematic fallback ──────────────────────────────────
+        note = "⚠️ Both original and rewritten prompts blocked — used safe cinematic fallback"
+        fallback_prompt = random.choice(SAFE_FALLBACK_PROMPTS)
+        for attempt in range(3):
+            try:
+                return call_openai_image(fallback_prompt), fallback_prompt, note
+            except Exception:
+                if attempt < 2:
+                    time.sleep(5)
+
+        raise RuntimeError(
+            f"All 3 layers failed for scene '{scene_id}'. Last error: {last_err}"
+        )
 
     if st.button("🖼️ Generate all scene images", type="primary", key="step1_generate_btn"):
         progress = st.progress(0.0)
@@ -302,24 +395,47 @@ def render_step1():
 
         for i, row in df.iterrows():
             scene_id = str(row["id"])
+            script_text = str(row.get("script_text", "")).strip()
             prompt = f"{str(row['image_prompt']).strip()}, {style_suffix}".strip(", ")
             status.write(f"Generating {i+1}/{n}: `{scene_id}`")
             try:
-                img_bytes = generate_image_openai(prompt)
+                img_bytes, used_prompt, note = generate_image_openai(
+                    prompt, scene_id, script_text
+                )
                 fname = f"{safe_name(scene_id)}.png"
                 image_bufs[scene_id] = (fname, img_bytes)
-                results.append({"id": scene_id, "status": "✅ OK", "prompt": prompt})
+                status_label = f"✅ OK{' — ' + note if note else ''}"
+                results.append({
+                    "id": scene_id,
+                    "status": status_label,
+                    "original_prompt": prompt,
+                    "used_prompt": used_prompt,
+                })
             except Exception as e:
-                results.append({"id": scene_id, "status": f"❌ {e}", "prompt": prompt})
+                results.append({
+                    "id": scene_id,
+                    "status": f"❌ {e}",
+                    "original_prompt": prompt,
+                    "used_prompt": "",
+                })
             progress.progress((i + 1) / n)
             if pace_delay > 0 and i < n - 1:
                 time.sleep(pace_delay)
 
         results_df = pd.DataFrame(results)
         st.subheader("Results")
+
+        # Highlight rewritten/fallback rows so user can review what changed
+        rewrites = results_df[results_df["status"].str.contains("rewritten|fallback", case=False, na=False)]
+        if not rewrites.empty:
+            st.warning(
+                f"⚠️ {len(rewrites)} scene(s) had their prompt auto-rewritten due to policy blocks. "
+                "Review the 'used_prompt' column below to see what was actually generated."
+            )
+
         st.dataframe(results_df, use_container_width=True)
 
-        n_ok = (results_df["status"] == "✅ OK").sum()
+        n_ok = results_df["status"].str.startswith("✅").sum()
         st.success(f"{n_ok}/{n} images generated.")
 
         if n_ok == 0:
