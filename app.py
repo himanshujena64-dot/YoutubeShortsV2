@@ -21,6 +21,16 @@ st.set_page_config(page_title="Shorts Maker", page_icon="🎬", layout="wide")
 
 MUSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")
 
+# Git doesn't track empty folders, so on a fresh deploy (e.g. Streamlit Cloud)
+# these may not exist even if they were created locally. Recreate them at
+# startup so pick_music_track() never has to deal with a missing directory.
+_MOOD_FOLDERS = [
+    "upbeat", "dramatic", "calm", "inspirational", "suspense",
+    "sad", "romantic", "epic", "energetic", "nostalgic",
+]
+for _mood in _MOOD_FOLDERS:
+    os.makedirs(os.path.join(MUSIC_DIR, _mood), exist_ok=True)
+
 # ---------------------------------------------------------------------------
 # Shared session state
 # ---------------------------------------------------------------------------
@@ -28,6 +38,8 @@ if "generated_images" not in st.session_state:
     st.session_state.generated_images = {}   # scene_id -> (filename, bytes)
 if "generated_images_log" not in st.session_state:
     st.session_state.generated_images_log = None
+if "step1_script_df" not in st.session_state:
+    st.session_state.step1_script_df = None   # the Excel parsed in Step 1, reused in Step 2
 
 # ---------------------------------------------------------------------------
 # Mood classifier (Step 2 background music)
@@ -103,12 +115,19 @@ def classify_mood(full_text: str) -> str:
 
 def pick_music_track(mood: str, music_root: str):
     """Pick a random track for the given mood. Falls back to any available
-    track from other mood folders if the requested mood folder is empty."""
+    track from other mood folders if the requested mood folder is empty.
+    Returns None (never crashes) if no music directory/files exist at all —
+    background music is optional, not required for the video to succeed."""
     def tracks_in(folder):
         result = []
+        if not os.path.isdir(folder):
+            return result
         for ext in ("*.mp3", "*.wav", "*.m4a"):
             result.extend(glob.glob(os.path.join(folder, ext)))
         return result
+
+    if not os.path.isdir(music_root):
+        return None
 
     # Try exact mood first
     candidates = tracks_in(os.path.join(music_root, mood))
@@ -260,6 +279,9 @@ def render_step1():
         st.error(f"Excel is missing column(s): {', '.join(sorted(missing_cols))}")
         return
 
+    # Save to session state so Step 2 can reuse it without a re-upload
+    st.session_state.step1_script_df = df.copy()
+
     df = df[df["image_prompt"].notna()].reset_index(drop=True)
     n = len(df)
     est_cost = n * cost_map[quality]
@@ -391,6 +413,8 @@ def render_step1():
     if st.button("🖼️ Generate all scene images", type="primary", key="step1_generate_btn"):
         progress = st.progress(0.0)
         status = st.empty()
+        live_results_box = st.empty()
+        live_image_box = st.empty()
         results = []
         image_bufs = {}
 
@@ -398,7 +422,7 @@ def render_step1():
             scene_id = str(row["id"])
             script_text = str(row.get("script_text", "")).strip()
             prompt = f"{str(row['image_prompt']).strip()}, {style_suffix}".strip(", ")
-            status.write(f"Generating {i+1}/{n}: `{scene_id}`")
+            status.write(f"⏳ Generating {i+1}/{n}: `{scene_id}`...")
             try:
                 img_bytes, used_prompt, note = generate_image_openai(
                     prompt, scene_id, script_text
@@ -412,6 +436,9 @@ def render_step1():
                     "original_prompt": prompt,
                     "used_prompt": used_prompt,
                 })
+                status.write(f"✅ {i+1}/{n} done: `{scene_id}`")
+                with live_image_box.container():
+                    st.image(img_bytes, caption=f"{scene_id} — just generated", width=200)
             except Exception as e:
                 results.append({
                     "id": scene_id,
@@ -419,12 +446,23 @@ def render_step1():
                     "original_prompt": prompt,
                     "used_prompt": "",
                 })
+                status.write(f"❌ {i+1}/{n} FAILED: `{scene_id}` — {e}")
+                live_image_box.empty()
+
+            # Update the running results table after every single scene
+            with live_results_box.container():
+                st.dataframe(pd.DataFrame(results), use_container_width=True)
+
             progress.progress((i + 1) / n)
             if pace_delay > 0 and i < n - 1:
                 time.sleep(pace_delay)
 
+        live_results_box.empty()
+        live_image_box.empty()
+        status.write("✅ Batch complete.")
+
         results_df = pd.DataFrame(results)
-        st.subheader("Results")
+        st.subheader("Final Results")
 
         # Highlight rewritten/fallback rows so user can review what changed
         rewrites = results_df[results_df["status"].str.contains("rewritten|fallback", case=False, na=False)]
@@ -671,39 +709,58 @@ def render_step2():
 
     # ── Narration script ──────────────────────────────────────────────────────
     st.subheader("📝 Narration script")
-    script_file = st.file_uploader(
-        "Narration Excel (.xlsx) — columns: id · script_text",
-        type=["xlsx", "xls"],
-        key="step2_script_upload",
-    )
 
-    if not script_file:
-        st.info("Upload your narration Excel to continue.")
-        if st.button("Download sample script template", key="step2_sample_btn"):
-            sample = pd.DataFrame({
-                "id": ["scene_01", "scene_02", "scene_03"],
-                "script_text": [
-                    "In 1983, nobody expected India to win the World Cup.",
-                    "The team walked onto the field at Lord's, underdogs once again.",
-                    "Kapil Dev led from the front, calm under pressure.",
-                ],
-            })
-            buf = io.BytesIO()
-            sample.to_excel(buf, index=False)
-            st.download_button(
-                "⬇️ script_template.xlsx",
-                data=buf.getvalue(),
-                file_name="script_template.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="step2_sample_dl",
-            )
-        return
+    script_from_step1 = st.session_state.step1_script_df
 
-    try:
-        script_df = pd.read_excel(script_file)
-    except Exception as e:
-        st.error(f"Could not read script Excel: {e}")
-        return
+    if script_from_step1 is not None:
+        use_step1_script = st.radio(
+            "Where is your narration script coming from?",
+            ["Use the Excel from Step 1 (already loaded)", "Upload a different Excel"],
+            index=0,
+            key="step2_script_source_radio",
+            help="Step 1's Excel already has id + script_text — no need to re-upload unless you want to use a different file.",
+        )
+    else:
+        use_step1_script = "Upload a different Excel"
+        st.info("No Excel loaded from Step 1 yet — please upload your narration Excel below.")
+
+    if use_step1_script == "Use the Excel from Step 1 (already loaded)":
+        script_df = script_from_step1.copy()
+        st.success(f"✅ Using the {len(script_df)}-row Excel already loaded from Step 1.")
+    else:
+        script_file = st.file_uploader(
+            "Narration Excel (.xlsx) — columns: id · script_text",
+            type=["xlsx", "xls"],
+            key="step2_script_upload",
+        )
+
+        if not script_file:
+            st.info("Upload your narration Excel to continue.")
+            if st.button("Download sample script template", key="step2_sample_btn"):
+                sample = pd.DataFrame({
+                    "id": ["scene_01", "scene_02", "scene_03"],
+                    "script_text": [
+                        "In 1983, nobody expected India to win the World Cup.",
+                        "The team walked onto the field at Lord's, underdogs once again.",
+                        "Kapil Dev led from the front, calm under pressure.",
+                    ],
+                })
+                buf = io.BytesIO()
+                sample.to_excel(buf, index=False)
+                st.download_button(
+                    "⬇️ script_template.xlsx",
+                    data=buf.getvalue(),
+                    file_name="script_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="step2_sample_dl",
+                )
+            return
+
+        try:
+            script_df = pd.read_excel(script_file)
+        except Exception as e:
+            st.error(f"Could not read script Excel: {e}")
+            return
 
     script_df.columns = [str(c).strip().lower() for c in script_df.columns]
     if "id" not in script_df.columns or "script_text" not in script_df.columns:
