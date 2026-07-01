@@ -433,25 +433,31 @@ def render_step1():
         return buf.getvalue()
 
     def call_gemini_image(prompt: str) -> bytes:
-        """Gemini Imagen 3 image call via google-genai SDK — returns PNG bytes."""
+        """Gemini image call using gemini-2.5-flash-image (Nano Banana) — returns PNG bytes.
+        Uses generate_content with IMAGE modality — the correct method as of mid-2026.
+        Imagen 3 is deprecated; the new recommended model is gemini-2.5-flash-image."""
         from google import genai as _genai
-        from google.genai import types as _gtypes
+        from google.genai.types import GenerateContentConfig, Modality
         client = _genai.Client(api_key=gemini_api_key)
-        response = client.models.generate_images(
-            model="imagen-3.0-generate-002",
-            prompt=prompt,
-            config=_gtypes.GenerateImagesConfig(
-                number_of_images=1,
-                aspect_ratio="9:16",
-                output_mime_type="image/png",
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=f"Generate a photorealistic 9:16 vertical image: {prompt}",
+            config=GenerateContentConfig(
+                response_modalities=[Modality.IMAGE],
             ),
         )
-        img_bytes = response.generated_images[0].image.image_bytes
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img = ensure_9x16(img, 1080, 1920)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        # Find the image part in the response
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, "inline_data") and part.inline_data:
+                img_bytes = part.inline_data.data
+                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                img = ensure_9x16(img, 1080, 1920)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                return buf.getvalue()
+        raise RuntimeError(
+            "Gemini returned no image. Check your GEMINI_API_KEY and that billing is enabled."
+        )
 
     def call_image_api(prompt: str) -> bytes:
         """Route to the selected provider."""
@@ -1001,6 +1007,29 @@ def render_step2():
             key="step2_music_mood",
         )
 
+        # ── Music preview ─────────────────────────────────────────────────────
+        if enable_music:
+            preview_mood = (
+                music_override.replace("Force: ", "")
+                if music_override != "Auto-detect from script"
+                else "dramatic"   # default preview mood when auto is selected
+            )
+            if st.button("🎵 Preview music track", key="step2_music_preview_btn",
+                         help="Plays a random track from the selected mood folder."):
+                track = pick_music_track(preview_mood, MUSIC_DIR)
+                if track is None:
+                    st.warning(
+                        f"No music files found in music/{preview_mood}/ — "
+                        "add .mp3 files to that folder and redeploy."
+                    )
+                else:
+                    with open(track, "rb") as f:
+                        track_bytes = f.read()
+                    ext = os.path.splitext(track)[1].lower().strip(".")
+                    fmt = "audio/wav" if ext == "wav" else "audio/mp3"
+                    st.audio(track_bytes, format=fmt)
+                    st.caption(f"🎵 {os.path.basename(track)} ({preview_mood})")
+
         st.divider()
         st.subheader("Outro")
         add_outro = st.checkbox(
@@ -1019,6 +1048,20 @@ def render_step2():
             disabled=not add_outro,
             key="step2_outro_hold",
             help="Keeps the outro visible a bit longer after the voice finishes speaking.",
+        )
+
+        st.divider()
+        st.subheader("Script settings")
+        MAX_WORDS = st.slider(
+            "Auto-split threshold (words per scene)",
+            min_value=10, max_value=40, value=22, step=1,
+            help=(
+                "Scenes longer than this word count are automatically split into "
+                "shorter chunks to prevent audio overlap. "
+                "22 words ≈ 8 seconds — safe for most voices and speeds. "
+                "Lower = more splits. Higher = fewer splits but more overlap risk."
+            ),
+            key="step2_max_words",
         )
 
         project_id = st.text_input(
@@ -1217,7 +1260,65 @@ def render_step2():
         st.error("No matched scenes to process.")
         return
 
-    # ── ffmpeg helpers ────────────────────────────────────────────────────────
+    # ── Auto-split long scenes ─────────────────────────────────────────────────
+    # Scenes over the threshold risk audio overlap / drift.
+    # Auto-split them into smaller chunks, reusing the same image for each chunk.
+    MAX_WORDS = st.session_state.get("step2_max_words", 22)
+
+    def split_into_sentences(text: str) -> list:
+        """Split on sentence-ending punctuation — but NOT on em-dash (—)
+        which Hindi uses as a pause mid-sentence, not a sentence boundary."""
+        import re
+        parts = re.split(r'(?<=[।.!?])\s+', text.strip())
+        return [p.strip() for p in parts if p.strip()]
+
+    def auto_split_df(df: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        for _, row in df.iterrows():
+            text = str(row["script_text"]).strip()
+            words = text.split()
+            if len(words) <= MAX_WORDS:
+                rows.append(row.to_dict())
+                continue
+            # Split into sentence-aware chunks
+            sentences = split_into_sentences(text)
+            chunk, chunk_idx = [], 1
+            for sent in sentences:
+                trial = chunk + [sent]
+                if len(" ".join(trial).split()) > MAX_WORDS and chunk:
+                    new_row = row.to_dict()
+                    new_row["id"] = f"{row['id']}_p{chunk_idx}"
+                    new_row["script_text"] = " ".join(chunk)
+                    rows.append(new_row)
+                    chunk = [sent]
+                    chunk_idx += 1
+                else:
+                    chunk.append(sent)
+            if chunk:
+                new_row = row.to_dict()
+                new_row["id"] = f"{row['id']}_p{chunk_idx}"
+                new_row["script_text"] = " ".join(chunk)
+                rows.append(new_row)
+        return pd.DataFrame(rows).reset_index(drop=True)
+
+    original_count = len(valid_df)
+    valid_df = auto_split_df(valid_df)
+    split_count = len(valid_df) - original_count
+
+    if split_count > 0:
+        st.info(
+            f"✂️ **Auto-split:** {split_count} long scene(s) were automatically split into "
+            f"shorter chunks (max {MAX_WORDS} words each) to prevent audio overlap. "
+            f"Total scenes after split: **{len(valid_df)}**"
+        )
+        st.dataframe(
+            valid_df[["id", "script_text"]].assign(
+                words=valid_df["script_text"].str.split().str.len()
+            ),
+            use_container_width=True,
+        )
+
+
     def generate_voiceover(text: str, out_path: str):
         last_err = None
         for attempt in range(3):
@@ -1402,58 +1503,81 @@ def render_step2():
 
     def make_outro_clip(duration: float, out_path: str, last_image_path: str = None):
         """
-        Build the subscribe outro clip: a dark gradient background (or the last
-        scene's image, dimmed) with bold centred text reading the outro message.
-        Uses ffmpeg drawtext — no extra dependencies needed.
+        Build the subscribe outro clip using PIL to burn text directly onto
+        the image — avoids all ffmpeg drawtext escaping issues entirely.
         """
-        fps = 25
-        TARGET_W, TARGET_H = 1080, 1920
-
-        # Escape text for ffmpeg drawtext (colons and quotes need escaping)
-        def escape_drawtext(s: str) -> str:
-            return (
-                s.replace("\\", "\\\\")
-                 .replace(":", "\\:")
-                 .replace("'", "\u2019")  # smart quote avoids breaking the filter
-                 .replace("%", "\\%")
-            )
-
-        safe_text = escape_drawtext(outro_text)
-
-        # Wrap long text manually since drawtext doesn't auto-wrap —
-        # split into lines of ~28 chars for a clean centred block.
         import textwrap
-        wrapped_lines = textwrap.wrap(outro_text, width=28)
-        wrapped_escaped = "\\n".join(escape_drawtext(line) for line in wrapped_lines)
+        from PIL import ImageDraw, ImageFont
 
+        TARGET_W, TARGET_H = 1080, 1920
+        fps = 25
+
+        # ── Build background frame ────────────────────────────────────────────
         if last_image_path and os.path.isfile(last_image_path):
-            # Reuse the last scene's image, dimmed, as the outro background
-            base_input = ["-loop", "1", "-i", last_image_path]
-            base_filter = (
-                f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=increase,"
-                f"crop={TARGET_W}:{TARGET_H},"
-                f"eq=brightness=-0.35:saturate=0.6,"
-            )
+            bg = Image.open(last_image_path).convert("RGB")
+            bg = ensure_9x16(bg, TARGET_W, TARGET_H)
+            # Dim the background
+            overlay = Image.new("RGB", bg.size, (0, 0, 0))
+            bg = Image.blend(bg, overlay, alpha=0.55)
         else:
-            # Fallback: plain dark gradient background generated by ffmpeg itself
-            base_input = ["-f", "lavfi", "-i",
-                           f"color=c=0x1a1a2e:s={TARGET_W}x{TARGET_H}:d={duration}"]
-            base_filter = ""
+            bg = Image.new("RGB", (TARGET_W, TARGET_H), (26, 26, 46))
 
-        vf = (
-            f"{base_filter}"
-            f"drawtext=text='{wrapped_escaped}':fontcolor=white:fontsize=58:"
-            f"font='DejaVu Sans Bold':line_spacing=14:"
-            f"x=(w-text_w)/2:y=(h-text_h)/2:"
-            f"box=1:boxcolor=black@0.35:boxborderw=20,"
-            f"drawtext=text='Subscribe':fontcolor=0xff0000:fontsize=72:"
-            f"font='DejaVu Sans Bold':x=(w-text_w)/2:y=h*0.72,"
-            f"fade=t=in:st=0:d=0.4"
+        draw = ImageDraw.Draw(bg)
+
+        # ── Load fonts (fall back to default if DejaVu not available) ─────────
+        def load_font(size):
+            font_paths = [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            ]
+            for fp in font_paths:
+                if os.path.isfile(fp):
+                    return ImageFont.truetype(fp, size)
+            return ImageFont.load_default()
+
+        font_body = load_font(52)
+        font_sub  = load_font(80)
+
+        # ── Draw main outro text (wrapped) ────────────────────────────────────
+        lines = textwrap.wrap(outro_text, width=26)
+        line_h = 64
+        total_text_h = len(lines) * line_h
+        y_start = TARGET_H // 2 - total_text_h // 2 - 60
+
+        for i, line in enumerate(lines):
+            bbox = draw.textbbox((0, 0), line, font=font_body)
+            tw = bbox[2] - bbox[0]
+            x = (TARGET_W - tw) // 2
+            y = y_start + i * line_h
+            # Shadow
+            draw.text((x + 2, y + 2), line, font=font_body, fill=(0, 0, 0, 180))
+            draw.text((x, y), line, font=font_body, fill=(255, 255, 255))
+
+        # ── Draw red Subscribe button ─────────────────────────────────────────
+        sub_text = "▶  Subscribe"
+        bbox = draw.textbbox((0, 0), sub_text, font=font_sub)
+        sw, sh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        sx = (TARGET_W - sw) // 2
+        sy = int(TARGET_H * 0.70)
+        # Red pill background
+        pad = 24
+        draw.rounded_rectangle(
+            [sx - pad, sy - pad, sx + sw + pad, sy + sh + pad],
+            radius=20, fill=(220, 30, 30)
         )
+        draw.text((sx, sy), sub_text, font=font_sub, fill=(255, 255, 255))
+
+        # ── Save frame as PNG and build video from it ─────────────────────────
+        frame_path = os.path.join(work_dir, "outro_frame.png")
+        bg.save(frame_path, "PNG")
 
         subprocess.run(
-            ["ffmpeg", "-y", *base_input, "-vf", vf,
-             "-t", str(duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", out_path],
+            ["ffmpeg", "-y",
+             "-loop", "1", "-i", frame_path,
+             "-vf", f"fade=t=in:st=0:d=0.4,scale={TARGET_W}:{TARGET_H}",
+             "-t", str(duration),
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", out_path],
             capture_output=True, check=True,
         )
 
