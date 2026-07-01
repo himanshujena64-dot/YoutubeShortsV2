@@ -16,10 +16,14 @@ import streamlit as st
 from elevenlabs.client import ElevenLabs
 from openai import OpenAI
 try:
-    import google.generativeai as genai
+    from google import genai as genai_sdk
     GEMINI_AVAILABLE = True
 except ImportError:
-    GEMINI_AVAILABLE = False
+    try:
+        import google.generativeai as genai_sdk
+        GEMINI_AVAILABLE = True
+    except ImportError:
+        GEMINI_AVAILABLE = False
 
 try:
     import fal_client
@@ -285,9 +289,9 @@ def render_step1():
         if not GEMINI_AVAILABLE:
             st.error("google-generativeai package not installed. Add 'google-generativeai' to requirements.txt.")
             return
-        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        gemini_client = genai.ImageGenerationModel("imagen-3.0-generate-002")
+        gemini_api_key = st.secrets["GEMINI_API_KEY"]
         openai_client = None
+        gemini_client = None   # not used — we call the API directly in call_gemini_image
     else:
         if "OPENAI_API_KEY" not in st.secrets:
             st.error(
@@ -429,13 +433,20 @@ def render_step1():
         return buf.getvalue()
 
     def call_gemini_image(prompt: str) -> bytes:
-        """Gemini imagen-3.0 image call — returns PNG bytes."""
-        response = gemini_client.generate_images(
+        """Gemini Imagen 3 image call via google-genai SDK — returns PNG bytes."""
+        from google import genai as _genai
+        from google.genai import types as _gtypes
+        client = _genai.Client(api_key=gemini_api_key)
+        response = client.models.generate_images(
+            model="imagen-3.0-generate-002",
             prompt=prompt,
-            number_of_images=1,
-            aspect_ratio="9:16",
+            config=_gtypes.GenerateImagesConfig(
+                number_of_images=1,
+                aspect_ratio="9:16",
+                output_mime_type="image/png",
+            ),
         )
-        img_bytes = response.images[0]._image_bytes
+        img_bytes = response.generated_images[0].image.image_bytes
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img = ensure_9x16(img, 1080, 1920)
         buf = io.BytesIO()
