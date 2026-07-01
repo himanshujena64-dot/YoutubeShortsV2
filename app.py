@@ -15,9 +15,50 @@ import requests
 import streamlit as st
 from elevenlabs.client import ElevenLabs
 from openai import OpenAI
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
+try:
+    import fal_client
+    FAL_AVAILABLE = True
+except ImportError:
+    FAL_AVAILABLE = False
 from PIL import Image
 
 st.set_page_config(page_title="Shorts Maker", page_icon="🎬", layout="wide")
+
+# ---------------------------------------------------------------------------
+# Password gate — set APP_PASSWORD in Streamlit secrets to enable.
+# If the secret is not set, the app runs open (for local dev).
+# ---------------------------------------------------------------------------
+def check_password() -> bool:
+    """Returns True if the user has entered the correct password."""
+    app_password = st.secrets.get("APP_PASSWORD", "")
+    if not app_password:
+        return True   # No password configured → open access (local dev)
+
+    if st.session_state.get("authenticated"):
+        return True
+
+    # Centre the login card
+    col1, col2, col3 = st.columns([1, 1.2, 1])
+    with col2:
+        st.markdown("## 🎬 Shorts Maker")
+        st.markdown("Enter the password to continue.")
+        pwd = st.text_input("Password", type="password", key="pwd_input")
+        if st.button("Login", type="primary", use_container_width=True):
+            if pwd == app_password:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("❌ Incorrect password. Try again.")
+    return False
+
+if not check_password():
+    st.stop()   # Everything below this line is hidden until login succeeds
 
 MUSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")
 
@@ -39,7 +80,11 @@ if "generated_images" not in st.session_state:
 if "generated_images_log" not in st.session_state:
     st.session_state.generated_images_log = None
 if "step1_script_df" not in st.session_state:
-    st.session_state.step1_script_df = None   # the Excel parsed in Step 1, reused in Step 2
+    st.session_state.step1_script_df = None
+if "step1_scene_prompts" not in st.session_state:
+    st.session_state.step1_scene_prompts = {}
+if "animated_clips" not in st.session_state:
+    st.session_state.animated_clips = {}
 
 # ---------------------------------------------------------------------------
 # Mood classifier (Step 2 background music)
@@ -176,28 +221,30 @@ def render_step1():
         "OpenAI gpt-image-1 → true 9:16 PNG images ready for Step 2"
     )
 
-    if "OPENAI_API_KEY" not in st.secrets:
-        st.error(
-            "Missing secret: OPENAI_API_KEY. "
-            "Add it under App Settings → Secrets or .streamlit/secrets.toml. "
-            "Get one at https://platform.openai.com/api-keys"
-        )
-        return
-
-    openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-
     # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
         st.subheader("Step 1 — Image settings")
 
+        image_provider = st.radio(
+            "Image provider",
+            ["OpenAI (gpt-image-1)", "Gemini (imagen-3.0)"],
+            index=0,
+            key="step1_provider",
+            help=(
+                "OpenAI gpt-image-1 — reliable, good quality, pay-per-image.\n\n"
+                "Gemini imagen-3.0 — Google's image model, often cheaper. "
+                "Requires GEMINI_API_KEY in secrets."
+            ),
+        )
+        use_gemini = image_provider == "Gemini (imagen-3.0)"
+
         quality = st.selectbox(
             "Image quality",
-            ["medium", "low", "high"],
+            ["medium", "low", "high"] if not use_gemini else ["standard", "hd"],
             index=0,
             help=(
-                "low  → cheapest, ~$0.011/image — good for drafts\n"
-                "medium → balanced, ~$0.042/image — recommended\n"
-                "high → best quality, ~$0.167/image — use sparingly"
+                "OpenAI: low ~$0.011 · medium ~$0.042 · high ~$0.167/image\n"
+                "Gemini: standard · hd"
             ),
             key="step1_quality",
         )
@@ -225,8 +272,34 @@ def render_step1():
             key="step1_project_id",
         )
 
+    # ── API client init (after sidebar so we know which provider is selected) ─
+    use_gemini = st.session_state.get("step1_provider", "OpenAI (gpt-image-1)") == "Gemini (imagen-3.0)"
+
+    if use_gemini:
+        if "GEMINI_API_KEY" not in st.secrets:
+            st.error(
+                "Gemini selected but GEMINI_API_KEY is missing from secrets. "
+                "Get one at https://aistudio.google.com/app/apikey and add it to your secrets."
+            )
+            return
+        if not GEMINI_AVAILABLE:
+            st.error("google-generativeai package not installed. Add 'google-generativeai' to requirements.txt.")
+            return
+        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+        gemini_client = genai.ImageGenerationModel("imagen-3.0-generate-002")
+        openai_client = None
+    else:
+        if "OPENAI_API_KEY" not in st.secrets:
+            st.error(
+                "Missing secret: OPENAI_API_KEY. "
+                "Add it under App Settings → Secrets or .streamlit/secrets.toml."
+            )
+            return
+        openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+        gemini_client = None
+
     # ── Cost info banner ──────────────────────────────────────────────────────
-    cost_map = {"low": 0.011, "medium": 0.042, "high": 0.167}
+    cost_map = {"low": 0.011, "medium": 0.042, "high": 0.167, "standard": 0.02, "hd": 0.08}
     st.info(
         f"💰 **Estimated cost:** ~${cost_map[quality]:.3f} per image at **{quality}** quality "
         f"(1024×1792 px, 9:16). "
@@ -344,17 +417,36 @@ def render_step1():
             model="gpt-image-1",
             prompt=prompt,
             n=1,
-            size="1024x1536",   # closest portrait size OpenAI supports — cropped to true 9:16 below
+            size="1024x1536",
             quality=quality,
         )
         b64 = response.data[0].b64_json
         img_bytes = base64.b64decode(b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        # 1024x1536 is 2:3, not 9:16 — crop/resize to exact 1080x1920 (9:16)
         img = ensure_9x16(img, 1080, 1920)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
+
+    def call_gemini_image(prompt: str) -> bytes:
+        """Gemini imagen-3.0 image call — returns PNG bytes."""
+        response = gemini_client.generate_images(
+            prompt=prompt,
+            number_of_images=1,
+            aspect_ratio="9:16",
+        )
+        img_bytes = response.images[0]._image_bytes
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img = ensure_9x16(img, 1080, 1920)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def call_image_api(prompt: str) -> bytes:
+        """Route to the selected provider."""
+        if use_gemini:
+            return call_gemini_image(prompt)
+        return call_openai_image(prompt)
 
     def generate_image_openai(prompt: str, scene_id: str, script_text: str):
         """
@@ -370,7 +462,7 @@ def render_step1():
         last_err = None
         for attempt in range(max_retries + 1):
             try:
-                return call_openai_image(prompt), prompt, note
+                return call_image_api(prompt), prompt, note
             except Exception as e:
                 last_err = str(e)
                 if is_policy_error(last_err):
@@ -386,7 +478,7 @@ def render_step1():
                 safe_prompt_full = f"{safe_prompt}, {style_suffix}".strip(", ")
                 for attempt in range(max_retries + 1):
                     try:
-                        return call_openai_image(safe_prompt_full), safe_prompt_full, note
+                        return call_image_api(safe_prompt_full), safe_prompt_full, note
                     except Exception as e2:
                         rewrite_err = str(e2)
                         if is_policy_error(rewrite_err):
@@ -401,7 +493,7 @@ def render_step1():
         fallback_prompt = random.choice(SAFE_FALLBACK_PROMPTS)
         for attempt in range(3):
             try:
-                return call_openai_image(fallback_prompt), fallback_prompt, note
+                return call_image_api(fallback_prompt), fallback_prompt, note
             except Exception:
                 if attempt < 2:
                     time.sleep(5)
@@ -484,34 +576,237 @@ def render_step1():
         # Store in session state → Step 2 picks them up automatically
         st.session_state.generated_images = image_bufs
         st.session_state.generated_images_log = results_df
-
-        # Preview
-        st.subheader("Preview")
-        cols = st.columns(4)
-        for idx, (sid, (fname, ibytes)) in enumerate(list(image_bufs.items())[:8]):
-            with cols[idx % 4]:
-                st.image(ibytes, caption=sid, use_container_width=True)
-
-        # Download ZIP
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for sid, (fname, ibytes) in image_bufs.items():
-                zf.writestr(fname, ibytes)
-        zip_buf.seek(0)
-
-        st.download_button(
-            "⬇️ Download all images (.zip)",
-            data=zip_buf.getvalue(),
-            file_name=f"{project_id_step1}.zip",
-            mime="application/zip",
-            key="step1_zip_dl",
-        )
+        # Also remember the prompts used, so "regenerate single image" has context
+        st.session_state.step1_scene_prompts = {
+            str(row["id"]): {
+                "image_prompt": str(row["image_prompt"]).strip(),
+                "script_text": str(row.get("script_text", "")).strip(),
+            }
+            for _, row in df.iterrows()
+        }
 
         st.success(
             "✅ Images ready — switch to **② Assemble Video** tab. "
             "They are already loaded; no need to re-upload."
         )
 
+    # ── Review & regenerate individual images ──────────────────────────────────
+    # This runs every time the page renders (not just after clicking Generate),
+    # so you can come back, review, and fix specific scenes any time.
+    if st.session_state.generated_images:
+        st.divider()
+        st.subheader("🔍 Review & fix individual images")
+        st.caption(
+            "Not happy with a specific scene? Edit its prompt below and regenerate "
+            "just that one — no need to redo the whole batch."
+        )
+
+        scene_prompts = st.session_state.get("step1_scene_prompts", {})
+
+        for sid, (fname, ibytes) in list(st.session_state.generated_images.items()):
+            with st.expander(f"🖼️ {sid}", expanded=False):
+                col_img, col_controls = st.columns([1, 2])
+                with col_img:
+                    st.image(ibytes, use_container_width=True)
+                with col_controls:
+                    existing = scene_prompts.get(sid, {})
+                    current_prompt = existing.get("image_prompt", "")
+                    current_script = existing.get("script_text", "")
+
+                    new_prompt = st.text_area(
+                        "Image prompt",
+                        value=current_prompt,
+                        key=f"regen_prompt_{sid}",
+                        height=100,
+                    )
+                    regen_key = f"regen_btn_{sid}"
+                    if st.button(f"🔄 Regenerate '{sid}'", key=regen_key):
+                        with st.spinner(f"Regenerating {sid}..."):
+                            full_prompt = f"{new_prompt.strip()}, {style_suffix}".strip(", ")
+                            try:
+                                img_bytes, used_prompt, note = generate_image_openai(
+                                    full_prompt, sid, current_script
+                                )
+                                new_fname = f"{safe_name(sid)}.png"
+                                st.session_state.generated_images[sid] = (new_fname, img_bytes)
+                                # Keep the edited prompt as the new baseline for next time
+                                if sid not in st.session_state.step1_scene_prompts:
+                                    st.session_state.step1_scene_prompts[sid] = {}
+                                st.session_state.step1_scene_prompts[sid]["image_prompt"] = new_prompt.strip()
+                                if note:
+                                    st.warning(note)
+                                st.success(f"✅ '{sid}' regenerated.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Regeneration failed: {e}")
+
+        # Re-export ZIP button reflecting any regenerations made above
+        st.divider()
+        zip_buf2 = io.BytesIO()
+        with zipfile.ZipFile(zip_buf2, "w", zipfile.ZIP_DEFLATED) as zf:
+            for sid, (fname, ibytes) in st.session_state.generated_images.items():
+                zf.writestr(fname, ibytes)
+        zip_buf2.seek(0)
+        st.download_button(
+            "⬇️ Download updated images (.zip)",
+            data=zip_buf2.getvalue(),
+            file_name=f"{project_id_step1}_updated.zip",
+            mime="application/zip",
+            key="step1_zip_dl_updated",
+        )
+
+
+
+
+# ===========================================================================
+# STEP 1.5 — Animate images → video clips via fal.ai Wan 2.1
+# ===========================================================================
+def render_step15():
+    st.header("🎞️ Step 1.5: Animate Images (fal.ai Wan 2.1)")
+    st.caption(
+        "Turn your static scene images into true animated video clips using Wan 2.1 — "
+        "people move, cameras orbit, fire and water flow. Then use these clips in Step 2."
+    )
+
+    if not FAL_AVAILABLE:
+        st.error(
+            "fal-client package not installed. Add `fal-client` to requirements.txt and redeploy."
+        )
+        return
+
+    if "FAL_KEY" not in st.secrets:
+        st.error(
+            "Missing secret: FAL_KEY. "
+            "Get a free API key at https://fal.ai → Dashboard → API Keys and add it to secrets."
+        )
+        return
+
+    import os
+    os.environ["FAL_KEY"] = st.secrets["FAL_KEY"]
+
+    images = st.session_state.generated_images
+    script_df = st.session_state.step1_script_df
+
+    if not images:
+        st.info("No images loaded yet — run Step 1 first to generate images.")
+        return
+
+    st.subheader("📋 Scenes to animate")
+
+    # Build table of scenes with their video_prompt
+    rows = []
+    for sid, (fname, ibytes) in images.items():
+        vp = ""
+        if script_df is not None and "video_prompt" in script_df.columns:
+            match = script_df[script_df["id"].astype(str) == str(sid)]
+            if not match.empty:
+                vp = str(match.iloc[0].get("video_prompt", "")).strip()
+        rows.append({"id": sid, "video_prompt": vp or "(auto — no prompt in Excel)"})
+
+    scenes_df = pd.DataFrame(rows)
+    st.dataframe(scenes_df, use_container_width=True)
+
+    with st.sidebar:
+        st.subheader("Step 1.5 — Animation settings")
+        clip_duration = st.selectbox(
+            "Clip duration (seconds)", [5, 10], index=0,
+            help="5 sec costs ~$0.025/clip · 10 sec costs ~$0.05/clip on fal.ai free trial.",
+            key="step15_duration",
+        )
+        default_motion = st.text_input(
+            "Default motion prompt (used if video_prompt column is empty)",
+            value="cinematic slow camera push forward, smooth motion, high quality",
+            key="step15_default_motion",
+        )
+
+    st.info(
+        f"💰 Estimated cost: ~${len(images) * 0.025 * (clip_duration // 5):.2f} "
+        f"for {len(images)} clips at {clip_duration}s each. "
+        "fal.ai gives $5 free trial credit — enough for ~200 clips."
+    )
+
+    if st.button("🎞️ Animate all scenes", type="primary", key="step15_animate_btn"):
+        progress = st.progress(0.0)
+        status = st.empty()
+        animated_clips = {}
+        results = []
+        total = len(images)
+
+        for i, (sid, (fname, ibytes)) in enumerate(images.items()):
+            status.write(f"⏳ Animating {i+1}/{total}: `{sid}`...")
+
+            # Get video_prompt from Excel if available
+            vp = default_motion
+            if script_df is not None and "video_prompt" in script_df.columns:
+                match = script_df[script_df["id"].astype(str) == str(sid)]
+                if not match.empty:
+                    col_val = str(match.iloc[0].get("video_prompt", "")).strip()
+                    if col_val and col_val.lower() not in ("nan", "none", ""):
+                        vp = col_val
+
+            try:
+                # Upload image to fal
+                import tempfile, base64 as b64mod
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp.write(ibytes)
+                    tmp_path = tmp.name
+
+                img_url = fal_client.upload_file(tmp_path)
+                os.unlink(tmp_path)
+
+                # Call Wan 2.1 image-to-video
+                result = fal_client.subscribe(
+                    "fal-ai/wan/v2.1/image-to-video",
+                    arguments={
+                        "image_url": img_url,
+                        "prompt": vp,
+                        "duration": str(clip_duration),
+                        "resolution": "480p",
+                    },
+                    with_logs=False,
+                )
+                video_url = result["video"]["url"]
+
+                # Download the clip
+                import requests as req
+                clip_bytes = req.get(video_url, timeout=120).content
+                animated_clips[sid] = (f"{sid}.mp4", clip_bytes)
+                results.append({"id": sid, "status": "✅ OK", "prompt_used": vp})
+                status.write(f"✅ {i+1}/{total} done: `{sid}`")
+
+            except Exception as e:
+                results.append({"id": sid, "status": f"❌ {e}", "prompt_used": vp})
+                status.write(f"❌ {i+1}/{total} FAILED: `{sid}`")
+
+            progress.progress((i + 1) / total)
+
+        st.session_state.animated_clips = animated_clips
+        results_df = pd.DataFrame(results)
+        st.subheader("Results")
+        st.dataframe(results_df, use_container_width=True)
+
+        n_ok = results_df["status"].str.startswith("✅").sum()
+        st.success(f"{n_ok}/{total} clips animated.")
+
+        if animated_clips:
+            # Download ZIP
+            import io as _io, zipfile as _zf
+            zip_buf = _io.BytesIO()
+            with _zf.ZipFile(zip_buf, "w", _zf.ZIP_DEFLATED) as zf:
+                for sid, (fname, cbytes) in animated_clips.items():
+                    zf.writestr(fname, cbytes)
+            zip_buf.seek(0)
+            st.download_button(
+                "⬇️ Download animated clips (.zip)",
+                data=zip_buf.getvalue(),
+                file_name="animated_clips.zip",
+                mime="application/zip",
+                key="step15_zip_dl",
+            )
+            st.success(
+                "✅ Clips ready — go to **② Assemble Video** tab and choose "
+                "'Upload a ZIP of pre-made video clips' then upload this ZIP."
+            )
 
 # ===========================================================================
 # STEP 2 — Assemble Video (ElevenLabs voice + pan/zoom + music)
@@ -597,6 +892,38 @@ def render_step2():
             key="step2_speed",
         )
 
+        # ── Voice preview (after controls so it uses the latest slider values) ─
+        st.divider()
+        preview_text = st.text_input(
+            "Preview text",
+            value="This is a quick preview of how this voice will sound in your video.",
+            key="step2_preview_text",
+            help="Edit this to test a line closer to your actual script if you like.",
+        )
+        if st.button("🔊 Preview this voice", key="step2_preview_btn"):
+            if not voice_id:
+                st.warning("Select or enter a Voice ID first.")
+            else:
+                with st.spinner("Generating preview..."):
+                    try:
+                        preview_audio = el_client.text_to_speech.convert(
+                            voice_id=voice_id,
+                            text=preview_text,
+                            model_id=tts_model,
+                            output_format="mp3_44100_128",
+                            voice_settings={
+                                "stability": voice_stability,
+                                "similarity_boost": voice_similarity,
+                                "style": voice_style,
+                                "speed": voice_speed,
+                            },
+                        )
+                        preview_bytes = b"".join(preview_audio)
+                        st.audio(preview_bytes, format="audio/mp3")
+                    except Exception as e:
+                        st.error(f"Preview failed: {e}")
+
+
         st.divider()
         st.subheader("Motion effect")
         effect_mode = st.radio(
@@ -663,48 +990,90 @@ def render_step2():
             key="step2_music_mood",
         )
 
+        st.divider()
+        st.subheader("Outro")
+        add_outro = st.checkbox(
+            "Add 'Subscribe' outro at the end", value=True, key="step2_add_outro"
+        )
+        outro_text = st.text_area(
+            "Outro narration + on-screen text",
+            value="If you liked this content, please subscribe and follow my channel for new videos every week!",
+            disabled=not add_outro,
+            key="step2_outro_text",
+            help="This will be narrated in the same voice and shown as text overlay on the last frame.",
+        )
+        outro_duration_extra = st.slider(
+            "Extra hold time after narration ends (sec)",
+            0.0, 3.0, 1.0, 0.5,
+            disabled=not add_outro,
+            key="step2_outro_hold",
+            help="Keeps the outro visible a bit longer after the voice finishes speaking.",
+        )
+
         project_id = st.text_input(
             "Project ID",
             value=datetime.now().strftime("short_%Y%m%d_%H%M%S"),
             key="step2_project_id",
         )
 
-    # ── Image source: two clear paths ─────────────────────────────────────────
-    st.subheader("📁 Image source")
+    # ── Media source: 3-way picker ────────────────────────────────────────────
+    st.subheader("📁 Media source")
 
     images_from_step1 = st.session_state.generated_images
 
-    source_options = ["Use images from Step 1 (already loaded)", "Upload a ZIP of pre-made images"]
+    ALL_SOURCES = [
+        "Use images from Step 1 (already loaded)",
+        "Upload a ZIP of pre-made images",
+        "Upload a ZIP of pre-made video clips (skip pan/zoom)",
+    ]
     if not images_from_step1:
-        # Force zip upload if Step 1 hasn't run
-        source_choice = "Upload a ZIP of pre-made images"
-        st.info("No images from Step 1 yet — please upload a ZIP of your images below.")
+        source_choice = st.radio(
+            "Where is your media coming from?",
+            ALL_SOURCES[1:],   # hide Step 1 option if nothing generated yet
+            index=0,
+            key="step2_source_radio",
+        )
     else:
         source_choice = st.radio(
-            "Where are your images coming from?",
-            source_options,
+            "Where is your media coming from?",
+            ALL_SOURCES,
             index=0,
             key="step2_source_radio",
             help=(
-                "**Step 1 images** — generated moments ago in this session, loaded automatically.\n\n"
-                "**Upload ZIP** — images you already have on disk, named `<id>.png` to match your Excel."
+                "**Step 1 images** — generated this session, loaded automatically.\n\n"
+                "**Image ZIP** — pre-made images named `<id>.png` to match your Excel.\n\n"
+                "**Video clip ZIP** — pre-made 5-sec clips named `<id>.mp4`. The app "
+                "will skip pan/zoom and use your clips directly, adding only voiceover + music."
             ),
         )
 
     images_zip = None
+    clips_zip = None
+    using_prebuilt_clips = source_choice == "Upload a ZIP of pre-made video clips (skip pan/zoom)"
+
     if source_choice == "Upload a ZIP of pre-made images":
         st.markdown(
-            "**Naming rule:** each image filename must match the `id` in your Excel exactly. "
-            "Example: if your Excel row has `id = scene_01`, the file must be `scene_01.png` (or .jpg). "
-            "The **order in the Excel** controls the scene sequence in the final video."
+            "**Naming rule:** `scene_01.png` → Excel row `id = scene_01`. "
+            "Row order in Excel controls scene sequence."
         )
-        images_zip = st.file_uploader(
-            "Scene images (.zip)",
-            type=["zip"],
-            key="step2_zip_upload",
-        )
+        images_zip = st.file_uploader("Scene images (.zip)", type=["zip"], key="step2_zip_upload")
         if not images_zip:
-            st.info("Upload your ZIP to continue.")
+            st.info("Upload your image ZIP to continue.")
+            return
+
+    elif using_prebuilt_clips:
+        st.markdown(
+            "**Naming rule:** `scene_01.mp4` → Excel row `id = scene_01`. "
+            "Each clip can be any length — voiceover duration controls the final clip timing. "
+            "Row order in Excel controls scene sequence."
+        )
+        clips_zip = st.file_uploader(
+            "Pre-made video clips (.zip of .mp4/.mov files)",
+            type=["zip"],
+            key="step2_clips_zip_upload",
+        )
+        if not clips_zip:
+            st.info("Upload your video clips ZIP to continue.")
             return
 
     # ── Narration script ──────────────────────────────────────────────────────
@@ -769,12 +1138,17 @@ def render_step2():
 
     script_df = script_df[script_df["script_text"].notna()].reset_index(drop=True)
 
-    # ── Extract images to disk ─────────────────────────────────────────────────
+    # ── Extract media to disk ──────────────────────────────────────────────────
     work_dir = tempfile.mkdtemp(prefix="shorts_")
     images_dir = os.path.join(work_dir, "images")
+    clips_dir  = os.path.join(work_dir, "prebuilt_clips")
     os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(clips_dir,  exist_ok=True)
 
-    if source_choice == "Use images from Step 1 (already loaded)":
+    if using_prebuilt_clips:
+        with zipfile.ZipFile(clips_zip) as zf:
+            zf.extractall(clips_dir)
+    elif source_choice == "Use images from Step 1 (already loaded)":
         for sid, (fname, ibytes) in images_from_step1.items():
             with open(os.path.join(images_dir, fname), "wb") as f:
                 f.write(ibytes)
@@ -788,18 +1162,28 @@ def render_step2():
             if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
                 image_files.append(os.path.join(root, f))
 
-    def find_image(scene_id: str):
+    clip_files_prebuilt = []
+    for root, _, files in os.walk(clips_dir):
+        for f in files:
+            if f.lower().endswith((".mp4", ".mov", ".webm")):
+                clip_files_prebuilt.append(os.path.join(root, f))
+
+    def find_media(scene_id: str):
+        """Find image OR pre-built clip for a scene by matching filename stem to id."""
         sid = str(scene_id).strip()
-        for path in image_files:
+        search_pool = clip_files_prebuilt if using_prebuilt_clips else image_files
+        for path in search_pool:
             stem = os.path.splitext(os.path.basename(path))[0]
             if stem == sid:
                 return path
-        # Fuzzy fallback: prefix match
-        for path in image_files:
+        for path in search_pool:
             stem = os.path.splitext(os.path.basename(path))[0]
             if stem.startswith(sid + "_") or stem.startswith(sid + "-"):
                 return path
         return None
+
+    # Keep backward-compat alias
+    find_image = find_media
 
     script_df["image_path"] = script_df["id"].apply(find_image)
     missing = script_df[script_df["image_path"].isna()]
@@ -1005,6 +1389,63 @@ def render_step2():
             capture_output=True, check=True,
         )
 
+    def make_outro_clip(duration: float, out_path: str, last_image_path: str = None):
+        """
+        Build the subscribe outro clip: a dark gradient background (or the last
+        scene's image, dimmed) with bold centred text reading the outro message.
+        Uses ffmpeg drawtext — no extra dependencies needed.
+        """
+        fps = 25
+        TARGET_W, TARGET_H = 1080, 1920
+
+        # Escape text for ffmpeg drawtext (colons and quotes need escaping)
+        def escape_drawtext(s: str) -> str:
+            return (
+                s.replace("\\", "\\\\")
+                 .replace(":", "\\:")
+                 .replace("'", "\u2019")  # smart quote avoids breaking the filter
+                 .replace("%", "\\%")
+            )
+
+        safe_text = escape_drawtext(outro_text)
+
+        # Wrap long text manually since drawtext doesn't auto-wrap —
+        # split into lines of ~28 chars for a clean centred block.
+        import textwrap
+        wrapped_lines = textwrap.wrap(outro_text, width=28)
+        wrapped_escaped = "\\n".join(escape_drawtext(line) for line in wrapped_lines)
+
+        if last_image_path and os.path.isfile(last_image_path):
+            # Reuse the last scene's image, dimmed, as the outro background
+            base_input = ["-loop", "1", "-i", last_image_path]
+            base_filter = (
+                f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=increase,"
+                f"crop={TARGET_W}:{TARGET_H},"
+                f"eq=brightness=-0.35:saturate=0.6,"
+            )
+        else:
+            # Fallback: plain dark gradient background generated by ffmpeg itself
+            base_input = ["-f", "lavfi", "-i",
+                           f"color=c=0x1a1a2e:s={TARGET_W}x{TARGET_H}:d={duration}"]
+            base_filter = ""
+
+        vf = (
+            f"{base_filter}"
+            f"drawtext=text='{wrapped_escaped}':fontcolor=white:fontsize=58:"
+            f"font='DejaVu Sans Bold':line_spacing=14:"
+            f"x=(w-text_w)/2:y=(h-text_h)/2:"
+            f"box=1:boxcolor=black@0.35:boxborderw=20,"
+            f"drawtext=text='Subscribe':fontcolor=0xff0000:fontsize=72:"
+            f"font='DejaVu Sans Bold':x=(w-text_w)/2:y=h*0.72,"
+            f"fade=t=in:st=0:d=0.4"
+        )
+
+        subprocess.run(
+            ["ffmpeg", "-y", *base_input, "-vf", vf,
+             "-t", str(duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", out_path],
+            capture_output=True, check=True,
+        )
+
     def mux(video: str, audio: str, out: str):
         subprocess.run(
             ["ffmpeg", "-y", "-i", video, "-i", audio,
@@ -1047,11 +1488,14 @@ def render_step2():
         for i, row in valid_df.iterrows():
             sid = str(row["id"])
             text = str(row["script_text"]).strip()
-            img_path = row["image_path"]
+            media_path = row["image_path"]   # could be image OR pre-built clip
 
-            # Pick effect
             chosen_effect = ai_pick_effect(text) if auto_mode else manual_effect
-            status.write(f"Processing {i+1}/{total}: `{sid}` — effect: *{chosen_effect}*")
+
+            if using_prebuilt_clips:
+                status.write(f"Processing {i+1}/{total}: `{sid}` — using pre-built clip")
+            else:
+                status.write(f"Processing {i+1}/{total}: `{sid}` — effect: *{chosen_effect}*")
 
             audio_path = os.path.join(work_dir, f"{safe_name(sid)}.mp3")
             video_only = os.path.join(work_dir, f"{safe_name(sid)}_video.mp4")
@@ -1060,18 +1504,31 @@ def render_step2():
             try:
                 generate_voiceover(text, audio_path)
                 dur = get_duration(audio_path)
-                make_clip(img_path, dur, video_only, chosen_effect)
+
+                if using_prebuilt_clips:
+                    # Trim or loop the pre-built clip to match voiceover duration
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", media_path,
+                         "-t", str(dur),
+                         "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+                         "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                         "-an", video_only],
+                        capture_output=True, check=True,
+                    )
+                else:
+                    make_clip(media_path, dur, video_only, chosen_effect)
+
                 mux(video_only, audio_path, clip_final)
                 clip_paths.append(clip_final)
                 results.append({
                     "id": sid, "script_text": text,
-                    "effect": chosen_effect,
+                    "effect": "pre-built clip" if using_prebuilt_clips else chosen_effect,
                     "duration_sec": round(dur, 2), "status": "✅ OK",
                 })
             except Exception as e:
                 results.append({
                     "id": sid, "script_text": text,
-                    "effect": chosen_effect,
+                    "effect": "pre-built clip" if using_prebuilt_clips else chosen_effect,
                     "duration_sec": None, "status": f"❌ {e}",
                 })
 
@@ -1087,6 +1544,28 @@ def render_step2():
         if not clip_paths:
             st.error("No scenes succeeded — nothing to stitch.")
             return
+
+        # ── Subscribe outro ──────────────────────────────────────────────────
+        if add_outro and outro_text.strip():
+            status.write("Generating subscribe outro...")
+            try:
+                outro_audio_path = os.path.join(work_dir, "outro.mp3")
+                outro_video_only = os.path.join(work_dir, "outro_video.mp4")
+                outro_final = os.path.join(work_dir, "outro_final.mp4")
+
+                generate_voiceover(outro_text.strip(), outro_audio_path)
+                outro_voice_dur = get_duration(outro_audio_path)
+                outro_total_dur = outro_voice_dur + outro_duration_extra
+
+                # Use the last successfully processed scene's image as a dimmed backdrop
+                last_img = valid_df.iloc[-1]["image_path"] if len(valid_df) > 0 else None
+
+                make_outro_clip(outro_total_dur, outro_video_only, last_image_path=last_img)
+                mux(outro_video_only, outro_audio_path, outro_final)
+                clip_paths.append(outro_final)
+                st.success("✅ Subscribe outro added.")
+            except Exception as e:
+                st.warning(f"⚠️ Outro generation failed, continuing without it: {e}")
 
         status.write("Stitching scenes together...")
         final_path = os.path.join(work_dir, f"{project_id}.mp4")
@@ -1145,8 +1624,10 @@ def render_step2():
 st.title("🎬 Shorts Maker")
 st.caption("Excel → OpenAI images (9:16) → ElevenLabs voice → pan/zoom video → YouTube Short")
 
-tab1, tab2 = st.tabs(["① Generate Images", "② Assemble Video"])
+tab1, tab15, tab2 = st.tabs(["① Generate Images", "① .5 Animate (fal.ai Wan)", "② Assemble Video"])
 with tab1:
     render_step1()
+with tab15:
+    render_step15()
 with tab2:
     render_step2()
