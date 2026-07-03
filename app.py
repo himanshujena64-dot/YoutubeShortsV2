@@ -76,6 +76,40 @@ _MOOD_FOLDERS = [
 for _mood in _MOOD_FOLDERS:
     os.makedirs(os.path.join(MUSIC_DIR, _mood), exist_ok=True)
 
+SFX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sfx")
+
+# ---------------------------------------------------------------------------
+# SFX library — split into two kinds because they need different mixing:
+#
+#   ONE-SHOT: a single short hit that plays once at the start of a scene
+#   (a bell, a ding, a camera click). Trimmed if longer than the scene.
+#
+#   AMBIENT/SUSTAINED: a continuous bed that should loop/fill the whole
+#   scene (ocean waves, a drone, distant thunder, a heartbeat). These are
+#   the layers a script means when it lists several things happening "in
+#   the background" at once (e.g. "deep ocean waves / low cinematic drone /
+#   distant thunder / heartbeat beginning in the background").
+#
+# Each key = a folder under sfx/. Drop .mp3/.wav/.m4a files into it. Both
+# lists are general-purpose, not tied to one script's topic.
+# ---------------------------------------------------------------------------
+_SFX_ONESHOT_FOLDERS = [
+    "whoosh", "dramatic_sting", "notification_ding", "coins", "applause",
+    "camera_shutter", "tick_tock", "page_turn", "door_creak",
+    "footsteps", "siren_alert", "magic_sparkle", "temple_bell",
+    "crowd_gasp", "typing", "phone_ring", "explosion_soft",
+    "success_chime", "sonar_ping", "thunder_crack",
+]
+_SFX_AMBIENT_FOLDERS = [
+    "ocean_waves", "cinematic_drone", "thunder_distant", "heartbeat_loop",
+    "wind_ambience", "rain_ambience", "fire_crackle", "city_ambience",
+    "forest_ambience", "crowd_ambience", "engine_hum", "clock_ambience",
+]
+_SFX_FOLDERS = _SFX_ONESHOT_FOLDERS + _SFX_AMBIENT_FOLDERS
+for _sfx in _SFX_FOLDERS:
+    os.makedirs(os.path.join(SFX_DIR, _sfx), exist_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # Shared session state
 # ---------------------------------------------------------------------------
@@ -189,6 +223,134 @@ def pick_music_track(mood: str, music_root: str):
         if entry.is_dir():
             all_tracks.extend(tracks_in(entry.path))
     return random.choice(all_tracks) if all_tracks else None
+
+
+def pick_sfx_clip(keyword: str, sfx_root: str):
+    """Resolve a free-text SFX cue (e.g. 'coins falling', 'deep ocean waves') to
+    a (file_path, folder_name) pair in the sfx/ library. Tries an exact
+    folder-name match, then substring match, then a small hint table for
+    common phrasings, then fuzzy match. Returns None (never raises) if
+    nothing matches — a scene with no match just plays with no SFX for
+    that cue."""
+    if not keyword or not str(keyword).strip():
+        return None
+    if not os.path.isdir(sfx_root):
+        return None
+
+    def tracks_in(folder):
+        result = []
+        for ext in ("*.mp3", "*.wav", "*.m4a"):
+            result.extend(glob.glob(os.path.join(folder, ext)))
+        return result
+
+    key = re.sub(r"[^a-z0-9 ]", "", str(keyword).strip().lower())
+    key_slug = key.replace(" ", "_")
+    folders = [e.name for e in os.scandir(sfx_root) if e.is_dir()]
+
+    def resolve(folder_name):
+        candidates = tracks_in(os.path.join(sfx_root, folder_name))
+        return (random.choice(candidates), folder_name) if candidates else None
+
+    # 1) exact folder name match
+    if key_slug in folders:
+        hit = resolve(key_slug)
+        if hit:
+            return hit
+
+    # 2) substring match either direction (e.g. "coins falling" ~ "coins")
+    for folder in folders:
+        if folder in key_slug or key_slug in folder:
+            hit = resolve(folder)
+            if hit:
+                return hit
+
+    # 3) hint table for common phrasings that don't literally contain the
+    # folder name (e.g. "deep ocean waves" -> ocean_waves folder)
+    SFX_HINTS = {
+        "ocean_waves": ["ocean", "sea wave", "waves crash", "surf"],
+        "cinematic_drone": ["drone", "low hum", "tension pad", "ambient tone"],
+        "thunder_distant": ["distant thunder", "thunder rumble", "storm rumble"],
+        "thunder_crack": ["thunder crack", "lightning strike", "thunder clap"],
+        "sonar_ping": ["sonar", "submarine ping", "radar ping"],
+        "heartbeat_loop": ["heartbeat", "heart beat", "pulse beat"],
+        "wind_ambience": ["wind blowing", "howling wind", "breeze"],
+        "rain_ambience": ["rain falling", "rainfall", "raindrops"],
+        "fire_crackle": ["fire crackle", "campfire", "burning"],
+        "city_ambience": ["city noise", "traffic ambience", "street ambience"],
+        "forest_ambience": ["forest sounds", "birds chirping", "jungle ambience"],
+        "crowd_ambience": ["crowd murmur", "crowd noise", "chatter"],
+        "engine_hum": ["engine sound", "machine hum", "motor hum"],
+    }
+    for folder, hints in SFX_HINTS.items():
+        if folder in folders and any(h in key for h in hints):
+            hit = resolve(folder)
+            if hit:
+                return hit
+
+    # 4) fuzzy match on the folder-name level
+    import difflib
+    close = difflib.get_close_matches(key_slug, folders, n=1, cutoff=0.5)
+    if close:
+        hit = resolve(close[0])
+        if hit:
+            return hit
+
+    return None
+
+
+def parse_sfx_cues(cell_text: str):
+    """Split a possibly multi-line/bulleted SFX cell into individual cues,
+    e.g.:
+        'Deep ocean waves\n* Low cinematic drone\n* Distant thunder\n
+         * Submarine sonar ping (very faint)\n* Slow heartbeat beginning
+         in the background'
+    becomes a list of cue dicts, one per layer, each carrying a parsed
+    volume (from '(faint)'/'(loud)' hints) and whether it should fade in
+    (from 'beginning'/'building'/'fading in' phrasing). A plain single-line
+    cell like 'coins falling' becomes a list with exactly one cue, so the
+    same code path handles both simple and layered SFX."""
+    if not cell_text or not str(cell_text).strip():
+        return []
+
+    raw = str(cell_text)
+    # Split on newlines/semicolons, and on bullet markers (*, -, •) at the
+    # start of a line.
+    parts = re.split(r"[\n;]+", raw)
+    parts = [re.sub(r"^\s*[\*\-•]\s*", "", p).strip() for p in parts]
+    parts = [p for p in parts if p]
+
+    # Single line with no bullets but multiple comma-separated cues
+    # (rare, but handle e.g. "thunder, sonar ping")
+    if len(parts) == 1 and "," in parts[0]:
+        comma_parts = [p.strip() for p in parts[0].split(",") if p.strip()]
+        if len(comma_parts) > 1:
+            parts = comma_parts
+
+    cues = []
+    for p in parts[:6]:   # cap layers per scene to keep mixes sane
+        text = p
+        volume = 1.0
+        low = text.lower()
+
+        m_faint = re.search(r"\((very faint|faint|quiet|subtle|low)\)", low)
+        if m_faint:
+            volume = 0.3 if "very" in m_faint.group(1) else 0.5
+            text = re.sub(r"\([^)]*\)", "", text).strip()
+
+        m_loud = re.search(r"\((loud|prominent|strong)\)", low)
+        if m_loud:
+            volume = 1.2
+            text = re.sub(r"\([^)]*\)", "", text).strip()
+
+        fade_in = any(
+            k in low for k in
+            ("beginning", "fading in", "fade in", "building", "growing", "starts low")
+        )
+
+        if text.strip():
+            cues.append({"text": text.strip(), "volume": volume, "fade_in": fade_in})
+
+    return cues
 
 
 def safe_name(s: str) -> str:
@@ -1031,6 +1193,34 @@ def render_step2():
                     st.caption(f"🎵 {os.path.basename(track)} ({preview_mood})")
 
         st.divider()
+        st.subheader("Scene-level SFX & music (optional, from Excel)")
+        st.caption(
+            "If your script Excel has **SFX** and/or **Background Music** columns filled in, "
+            "the app will use them automatically per scene. Leave a cell blank to skip it for "
+            "that scene. If the whole column is empty, this is ignored and the settings above "
+            "apply instead."
+        )
+        use_excel_sfx_music = st.checkbox(
+            "Use per-scene SFX / Background Music from Excel when present",
+            value=True,
+            key="step2_excel_sfx_music_enable",
+            help=(
+                "SFX: one simple cue ('coins falling') plays once at the start of the scene. "
+                "A multi-line/bulleted cell layers several sounds together, e.g.:\n"
+                "  Deep ocean waves\n"
+                "  * Low cinematic drone\n"
+                "  * Distant thunder\n"
+                "  * Heartbeat beginning in the background\n"
+                "Each line is matched to its own sfx/ folder. Ambient-type cues (waves, drone, "
+                "thunder, heartbeat) loop to fill the whole scene; '(faint)'/'(loud)' in a line "
+                "sets that layer's volume; 'beginning'/'building' fades that layer in.\n\n"
+                "Background Music: a mood per scene (e.g. 'dramatic', 'calm'). When the mood "
+                "changes between scenes, the music crossfades to the new track instead of "
+                "playing one fixed track for the whole video."
+            ),
+        )
+
+        st.divider()
         st.subheader("Outro")
         add_outro = st.checkbox(
             "Add 'Subscribe' outro at the end", value=True, key="step2_add_outro"
@@ -1186,9 +1376,21 @@ def render_step2():
             return
 
     script_df.columns = [str(c).strip().lower() for c in script_df.columns]
+    # Tolerate common spelling variants for the optional SFX / music columns
+    # (e.g. the shipped template has a "Backgound Music" typo).
+    _col_aliases = {
+        "backgound music": "background music",
+        "bg music": "background music",
+        "bgm": "background music",
+    }
+    script_df.columns = [_col_aliases.get(c, c) for c in script_df.columns]
     if "id" not in script_df.columns or "script_text" not in script_df.columns:
         st.error("Script Excel must have columns: id · script_text")
         return
+    has_excel_sfx_col = "sfx" in script_df.columns and script_df["sfx"].notna().any()
+    has_excel_music_col = (
+        "background music" in script_df.columns and script_df["background music"].notna().any()
+    )
 
     script_df = script_df[script_df["script_text"].notna()].reset_index(drop=True)
 
@@ -1611,14 +1813,132 @@ def render_step2():
             capture_output=True, check=True,
         )
 
+    def mix_layered_sfx_into_clip(clip_in: str, layers: list, out: str):
+        """Overlay one or more SFX layers onto a single scene clip, under the
+        voiceover already muxed into clip_in. Each layer is a dict:
+            {"path": str, "volume": float, "sustain": bool, "fade_in": bool}
+        - sustain=True (ambient folders, or any 'fade_in' cue) loops/trims the
+          file to fill the whole scene. sustain=False plays once from the
+          start and is trimmed if it runs long — never extends the scene.
+        - fade_in=True ramps the layer in from silence instead of starting
+          at full volume immediately.
+        Never raises past this point being reached — if a layer's ffmpeg
+        input is bad, the caller has already validated the path exists."""
+        duration = get_duration(clip_in)
+        cmd = ["ffmpeg", "-y", "-i", clip_in]
+        filter_parts = []
+        mix_labels = ["[0:a]"]
+
+        for idx, layer in enumerate(layers, start=1):
+            if layer["sustain"]:
+                cmd += ["-stream_loop", "-1", "-i", layer["path"]]
+            else:
+                cmd += ["-i", layer["path"]]
+
+            chain = f"[{idx}:a]volume={layer['volume']:.2f}"
+            if layer["fade_in"]:
+                fade_len = min(duration, 4.0) if not layer["sustain"] else duration
+                chain += f",afade=t=in:st=0:d={fade_len:.2f}"
+            chain += f",atrim=0:{duration:.3f}[a{idx}]"
+            filter_parts.append(chain)
+            mix_labels.append(f"[a{idx}]")
+
+        filter_parts.append(
+            f"{''.join(mix_labels)}amix=inputs={len(layers) + 1}:"
+            f"duration=first:dropout_transition=0.3[aout]"
+        )
+        fc = ";".join(filter_parts)
+        cmd += ["-filter_complex", fc, "-map", "0:v", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", out]
+        subprocess.run(cmd, capture_output=True, check=True)
+
+    def build_scene_music_track(scene_moods: list, scene_durations: list, out_path: str,
+                                 lufs: int, crossfade_sec: float = 1.0):
+        """Build one continuous background-music track for the whole video from
+        a per-scene list of moods, crossfading whenever the mood changes between
+        consecutive scenes. Scenes with the same mood as their neighbour just
+        flow into one longer segment (no crossfade needed inside a run).
+        Returns None if no mood could be resolved for any scene."""
+        # Group consecutive scenes with the same mood into segments
+        segments = []  # list of [mood, total_duration]
+        for mood, dur in zip(scene_moods, scene_durations):
+            if mood is None:
+                mood = "calm"  # last-resort fallback, never leaves a scene silent
+            if segments and segments[-1][0] == mood:
+                segments[-1][1] += dur
+            else:
+                segments.append([mood, dur])
+
+        if not segments:
+            return None
+
+        # Render each segment to its own trimmed/looped audio file
+        seg_files = []
+        for idx, (mood, dur) in enumerate(segments):
+            track = pick_music_track(mood, MUSIC_DIR)
+            if track is None:
+                continue
+            # Pad each segment by the crossfade amount (except the last) so
+            # joins never come up short once acrossfade trims them back down.
+            pad = crossfade_sec if idx < len(segments) - 1 else 0
+            seg_out = os.path.join(work_dir, f"_music_seg_{idx}.m4a")
+            subprocess.run(
+                ["ffmpeg", "-y", "-stream_loop", "-1", "-i", track,
+                 "-t", str(dur + pad),
+                 "-af", f"loudnorm=I={lufs}:TP=-2:LRA=11",
+                 "-c:a", "aac", seg_out],
+                capture_output=True, check=True,
+            )
+            seg_files.append(seg_out)
+
+        if not seg_files:
+            return None
+        if len(seg_files) == 1:
+            subprocess.run(["ffmpeg", "-y", "-i", seg_files[0], "-c:a", "aac", out_path],
+                            capture_output=True, check=True)
+            return out_path
+
+        # Chain acrossfade across all segments in order
+        current = seg_files[0]
+        for idx in range(1, len(seg_files)):
+            step_out = os.path.join(work_dir, f"_music_join_{idx}.m4a")
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", current, "-i", seg_files[idx],
+                 "-filter_complex",
+                 f"[0:a][1:a]acrossfade=d={crossfade_sec}:c1=tri:c2=tri[aout]",
+                 "-map", "[aout]", "-c:a", "aac", step_out],
+                capture_output=True, check=True,
+            )
+            current = step_out
+        os.replace(current, out_path)
+        return out_path
+
+    def mix_prebuilt_music_track(video_in: str, music_path: str, out: str):
+        """Mix a music track that's already the right length (built per-scene)
+        into the final video, without the stream_loop/duration-matching that
+        mix_music() does for a single repeating track."""
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", video_in, "-i", music_path,
+             "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+             "-map", "0:v", "-map", "[aout]",
+             "-c:v", "copy", "-c:a", "aac", "-shortest", out],
+            capture_output=True, check=True,
+        )
+
     # ── Main generate button ──────────────────────────────────────────────────
     if st.button("🎬 Generate voiceover + video", type="primary", key="step2_generate_btn"):
         progress = st.progress(0.0)
         status = st.empty()
         results = []
         clip_paths = []
+        scene_durations = []   # per-scene voiceover duration, in final order
+        scene_moods = []       # per-scene resolved background-music mood, or None
         total = len(valid_df)
         auto_mode = effect_mode == "🤖 Auto — AI picks per scene"
+
+        per_scene_music_active = use_excel_sfx_music and has_excel_music_col
+        per_scene_sfx_active = use_excel_sfx_music and has_excel_sfx_col
+        last_seen_mood = None   # carries forward across blank "background music" cells
 
         for i, row in valid_df.iterrows():
             sid = str(row["id"])
@@ -1654,17 +1974,63 @@ def render_step2():
                     make_clip(media_path, dur, video_only, chosen_effect)
 
                 mux(video_only, audio_path, clip_final)
+
+                # ── Optional per-scene SFX (from Excel "SFX" column) ────────────
+                # Supports a single simple cue ("coins falling") and a
+                # multi-line/bulleted cell with several layered cues
+                # ("Deep ocean waves\n* Low cinematic drone\n* Distant
+                # thunder\n* Heartbeat beginning in the background").
+                sfx_used = []
+                if per_scene_sfx_active:
+                    sfx_cell = row.get("sfx")
+                    if isinstance(sfx_cell, str) and sfx_cell.strip():
+                        cues = parse_sfx_cues(sfx_cell)
+                        layers = []
+                        for cue in cues:
+                            hit = pick_sfx_clip(cue["text"], SFX_DIR)
+                            if hit is None:
+                                status.write(f"  ⚠️ No SFX match for '{cue['text']}' — skipping that layer.")
+                                continue
+                            sfx_path, folder_name = hit
+                            layers.append({
+                                "path": sfx_path,
+                                "volume": cue["volume"],
+                                "sustain": folder_name in _SFX_AMBIENT_FOLDERS or cue["fade_in"],
+                                "fade_in": cue["fade_in"],
+                            })
+                            sfx_used.append(os.path.basename(sfx_path))
+                        if layers:
+                            sfx_out = os.path.join(work_dir, f"{safe_name(sid)}_sfx.mp4")
+                            mix_layered_sfx_into_clip(clip_final, layers, sfx_out)
+                            clip_final = sfx_out
+
                 clip_paths.append(clip_final)
+
+                # ── Optional per-scene background-music mood (from Excel) ───────
+                scene_mood = None
+                if per_scene_music_active:
+                    bgm_cue = row.get("background music")
+                    if isinstance(bgm_cue, str) and bgm_cue.strip():
+                        cue = bgm_cue.strip().lower()
+                        scene_mood = cue if cue in _MOOD_FOLDERS else classify_mood(cue)
+                        last_seen_mood = scene_mood
+                    else:
+                        scene_mood = last_seen_mood  # carry forward, may still be None
+                scene_durations.append(dur)
+                scene_moods.append(scene_mood)
+
                 results.append({
                     "id": sid, "script_text": text,
                     "effect": "pre-built clip" if using_prebuilt_clips else chosen_effect,
                     "duration_sec": round(dur, 2), "status": "✅ OK",
+                    "sfx": ", ".join(sfx_used), "music_mood": scene_mood or "",
                 })
             except Exception as e:
                 results.append({
                     "id": sid, "script_text": text,
                     "effect": "pre-built clip" if using_prebuilt_clips else chosen_effect,
                     "duration_sec": None, "status": f"❌ {e}",
+                    "sfx": "", "music_mood": "",
                 })
 
             progress.progress((i + 1) / total)
@@ -1698,6 +2064,10 @@ def render_step2():
                 make_outro_clip(outro_total_dur, outro_video_only, last_image_path=last_img)
                 mux(outro_video_only, outro_audio_path, outro_final)
                 clip_paths.append(outro_final)
+                # Keep the per-scene music track's total length in sync with
+                # the actual video length by covering the outro too.
+                scene_durations.append(outro_total_dur)
+                scene_moods.append(last_seen_mood)
                 st.success("✅ Subscribe outro added.")
             except Exception as e:
                 st.warning(f"⚠️ Outro generation failed, continuing without it: {e}")
@@ -1707,7 +2077,32 @@ def render_step2():
         try:
             concat(clip_paths, final_path)
 
-            if enable_music:
+            if enable_music and per_scene_music_active:
+                # ── Per-scene mode: crossfade between moods as they change ──────
+                # Backfill any leading scenes that had a blank cell before the
+                # first mood was ever specified.
+                first_mood = next((m for m in scene_moods if m), None)
+                filled_moods = [m or first_mood for m in scene_moods]
+
+                status.write("Building per-scene background music (with crossfades)...")
+                composite_path = os.path.join(work_dir, "_music_composite.m4a")
+                composite = build_scene_music_track(
+                    filled_moods, scene_durations, composite_path, music_target_lufs
+                )
+                if composite is None:
+                    st.warning(
+                        "No music files found for any of the requested moods — skipping "
+                        "background music. Add .mp3 files under music/<mood>/."
+                    )
+                else:
+                    with_music = os.path.join(work_dir, f"{project_id}_with_music.mp4")
+                    mix_prebuilt_music_track(final_path, composite, with_music)
+                    final_path = with_music
+                    import itertools
+                    mood_sequence = " → ".join(m for m, _ in itertools.groupby(filled_moods))
+                    st.info(f"🎵 Per-scene music (crossfaded): **{mood_sequence}**")
+
+            elif enable_music:
                 mood = (
                     classify_mood(" ".join(valid_df["script_text"].astype(str)))
                     if music_override == "Auto-detect from script"

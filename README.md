@@ -62,6 +62,48 @@ the app auto-picks based on detected mood.
 The app scans your combined `script_text` for mood keywords and picks
 accordingly; you can also force a mood manually in the sidebar.
 
+## 3b. Optional: per-scene SFX and per-scene background music
+
+You can add two extra columns to your script Excel. Both are fully
+**optional** — leave them out (or leave cells blank) and the app behaves
+exactly as before.
+
+| id | script_text | image_prompt | SFX | Background Music |
+|---|---|---|---|---|
+| scene_01 | ... | ... | temple bell | dramatic |
+| scene_02 | ... | ... | coins falling | dramatic |
+| scene_03 | ... | ... |  |  |
+
+- **`SFX`** — one simple cue ("coins falling", "temple bell") plays once at
+  the start of that scene. You can also write a **multi-line/bulleted cell**
+  to layer several sounds at once:
+  ```
+  Deep ocean waves
+  * Low cinematic drone
+  * Distant thunder
+  * Submarine sonar ping (very faint)
+  * Slow heartbeat beginning in the background
+  ```
+  Each line is matched independently against folders under `sfx/`:
+  - **One-shot** folders (`whoosh`, `coins`, `temple_bell`, `sonar_ping`, ...)
+    play once, trimmed to the scene length.
+  - **Ambient** folders (`ocean_waves`, `cinematic_drone`, `thunder_distant`,
+    `heartbeat_loop`, ...) loop to fill the entire scene.
+  - `(faint)` / `(very faint)` / `(loud)` in a line lowers/raises that
+    layer's volume; words like "beginning"/"building"/"fading in" make that
+    layer fade in from silence instead of starting instantly.
+  - Any line that doesn't match a folder is skipped with a warning — the
+    rest of the layers still play.
+- **`Background Music`** — a mood per scene (`upbeat`, `dramatic`, `calm`,
+  `inspirational`, `suspense`, `sad`, `romantic`, `epic`, `energetic`,
+  `nostalgic`). When the mood changes between scenes, the music crossfades
+  to the new mood's track instead of playing one fixed track for the whole
+  video. Leave a cell blank to keep the previous scene's mood playing.
+
+If the whole `Background Music` column is blank, the app falls back to the
+single auto-detected/forced mood behavior described above. Same for `SFX` —
+if the whole column is blank, no SFX are added.
+
 ## 4. Run locally
 
 ```bash
