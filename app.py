@@ -2011,9 +2011,16 @@ def render_step2():
                 dur = get_duration(audio_path)
 
                 if using_prebuilt_clips:
-                    # Trim or loop the pre-built clip to match voiceover duration
+                    # Trim OR loop the pre-built clip to match voiceover duration.
+                    # -stream_loop -1 loops the source indefinitely so that even a
+                    # short stock clip (e.g. 5s) is padded out to match a longer
+                    # voiceover (e.g. 12s) instead of being silently truncated by
+                    # the "-shortest" flag in mux() below. Without this, the video
+                    # track ends before the voiceover does, mux() cuts the audio
+                    # short to match, and the *next* scene's voice starts right on
+                    # top of the abrupt cut — which is what reads as "overlap".
                     subprocess.run(
-                        ["ffmpeg", "-y", "-i", media_path,
+                        ["ffmpeg", "-y", "-stream_loop", "-1", "-i", media_path,
                          "-t", str(dur),
                          "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
                          "-c:v", "libx264", "-pix_fmt", "yuv420p",
@@ -2110,6 +2117,22 @@ def render_step2():
 
                 # Use the last successfully processed scene's image as a dimmed backdrop
                 last_img = valid_df.iloc[-1]["image_path"] if len(valid_df) > 0 else None
+
+                # When source is a pre-built VIDEO clip (not a still image),
+                # PIL's Image.open() can't read it directly — that's the
+                # "cannot identify image file scene_XX.mp4" error. Grab the
+                # clip's last frame as a PNG first and use that instead.
+                if using_prebuilt_clips and last_img:
+                    extracted_frame = os.path.join(work_dir, "outro_last_frame.png")
+                    try:
+                        subprocess.run(
+                            ["ffmpeg", "-y", "-sseof", "-1", "-i", last_img,
+                             "-vframes", "1", extracted_frame],
+                            capture_output=True, check=True,
+                        )
+                        last_img = extracted_frame
+                    except Exception:
+                        last_img = None  # falls back to the plain solid backdrop
 
                 make_outro_clip(outro_total_dur, outro_video_only, last_image_path=last_img)
                 mux(outro_video_only, outro_audio_path, outro_final)
