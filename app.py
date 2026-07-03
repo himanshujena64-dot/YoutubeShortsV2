@@ -72,6 +72,9 @@ MUSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")
 _MOOD_FOLDERS = [
     "upbeat", "dramatic", "calm", "inspirational", "suspense",
     "sad", "romantic", "epic", "energetic", "nostalgic",
+    # extra moods
+    "mysterious", "triumphant", "playful", "heroic",
+    "chill", "horror", "corporate", "festive",
 ]
 for _mood in _MOOD_FOLDERS:
     os.makedirs(os.path.join(MUSIC_DIR, _mood), exist_ok=True)
@@ -182,6 +185,45 @@ MOOD_KEYWORDS = {
         "nostalg", "childhood", "remember", "those days", "used to", "back then",
         "classic", "vintage", "old", "young", "grew up", "past", "decade",
         "era", "generation", "tradition", "heritage", "roots", "origin",
+    ],
+    "mysterious": [
+        "mystery", "mysterious", "enigma", "curious", "puzzle", "riddle",
+        "strange", "odd", "unexplained", "peculiar", "cryptic", "veiled",
+        "obscure", "intrigue", "wonder", "baffling",
+    ],
+    "triumphant": [
+        "triumph", "victorious", "won the", "champion", "conquer", "prevail",
+        "achievement", "milestone", "breakthrough", "finally", "at last",
+        "overcame", "defeated", "crowned", "glory", "medal", "trophy",
+    ],
+    "playful": [
+        "funny", "silly", "playful", "joke", "quirky", "cute", "wacky",
+        "goofy", "laugh", "giggle", "prank", "cartoon", "whimsical",
+        "lighthearted", "fun fact", "cheeky",
+    ],
+    "heroic": [
+        "hero", "heroic", "courage", "brave", "underdog", "rise up",
+        "against all odds", "fight for", "stand up", "sacrifice", "rescue",
+        "saved", "protect", "defend", "champion of", "valor",
+    ],
+    "chill": [
+        "relax", "chill", "easygoing", "laid back", "vibe", "unwind",
+        "casual", "lazy", "cozy", "mellow", "leisure", "breeze", "hangout",
+    ],
+    "horror": [
+        "horror", "terrifying", "nightmare", "haunted", "creepy", "sinister",
+        "ghost", "demon", "curse", "chilling", "dread", "scream", "monster",
+        "eerie silence", "blood", "possessed",
+    ],
+    "corporate": [
+        "business", "strategy", "productivity", "efficient", "professional",
+        "workflow", "innovation", "startup", "growth", "market", "brand",
+        "leadership", "meeting", "corporate", "solution", "optimize",
+    ],
+    "festive": [
+        "festival", "holiday", "celebration", "festive", "carnival", "parade",
+        "christmas", "diwali", "new year", "eid", "birthday", "anniversary",
+        "confetti", "gathering", "feast",
     ],
 }
 
@@ -1158,6 +1200,14 @@ def render_step2():
                 "Force: epic",
                 "Force: energetic",
                 "Force: nostalgic",
+                "Force: mysterious",
+                "Force: triumphant",
+                "Force: playful",
+                "Force: heroic",
+                "Force: chill",
+                "Force: horror",
+                "Force: corporate",
+                "Force: festive",
             ],
             index=0,
             disabled=not enable_music,
