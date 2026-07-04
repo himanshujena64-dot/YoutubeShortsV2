@@ -428,7 +428,7 @@ def render_step1():
     st.header("🖼️ Step 1: Generate Scene Images")
     st.caption(
         "Upload an Excel with **id**, **script_text**, **image_prompt** → "
-        "OpenAI gpt-image-1 → true 9:16 PNG images ready for Step 2"
+        "OpenAI gpt-image-2/gpt-image-1 → true 9:16 PNG images ready for Step 2"
     )
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
@@ -437,23 +437,28 @@ def render_step1():
 
         image_provider = st.radio(
             "Image provider",
-            ["OpenAI (gpt-image-1)", "Gemini (imagen-3.0)"],
+            ["OpenAI (gpt-image-2)", "OpenAI (gpt-image-1)", "Gemini (imagen-3.0)"],
             index=0,
             key="step1_provider",
             help=(
-                "OpenAI gpt-image-1 — reliable, good quality, pay-per-image.\n\n"
+                "OpenAI gpt-image-2 — newest model, better quality, and actually "
+                "cheaper than gpt-image-1 at this app's 1024×1536 portrait size.\n\n"
+                "OpenAI gpt-image-1 — the previous model. OpenAI is deprecating it "
+                "on Oct 23, 2026, so gpt-image-2 is the recommended default now.\n\n"
                 "Gemini imagen-3.0 — Google's image model, often cheaper. "
                 "Requires GEMINI_API_KEY in secrets."
             ),
         )
         use_gemini = image_provider == "Gemini (imagen-3.0)"
+        openai_model = "gpt-image-2" if image_provider == "OpenAI (gpt-image-2)" else "gpt-image-1"
 
         quality = st.selectbox(
             "Image quality",
             ["medium", "low", "high"] if not use_gemini else ["standard", "hd"],
             index=0,
             help=(
-                "OpenAI: low ~$0.011 · medium ~$0.042 · high ~$0.167/image\n"
+                "gpt-image-2 (1024×1536): low ~$0.005 · medium ~$0.041 · high ~$0.165/image\n"
+                "gpt-image-1 (1024×1536): low ~$0.016 · medium ~$0.063 · high ~$0.25/image\n"
                 "Gemini: standard · hd"
             ),
             key="step1_quality",
@@ -483,7 +488,9 @@ def render_step1():
         )
 
     # ── API client init (after sidebar so we know which provider is selected) ─
-    use_gemini = st.session_state.get("step1_provider", "OpenAI (gpt-image-1)") == "Gemini (imagen-3.0)"
+    _provider_sess = st.session_state.get("step1_provider", "OpenAI (gpt-image-2)")
+    use_gemini = _provider_sess == "Gemini (imagen-3.0)"
+    openai_model = "gpt-image-2" if _provider_sess == "OpenAI (gpt-image-2)" else "gpt-image-1"
 
     if use_gemini:
         if "GEMINI_API_KEY" not in st.secrets:
@@ -509,10 +516,22 @@ def render_step1():
         gemini_client = None
 
     # ── Cost info banner ──────────────────────────────────────────────────────
-    cost_map = {"low": 0.011, "medium": 0.042, "high": 0.167, "standard": 0.02, "hd": 0.08}
+    # Prices are OpenAI's official per-image rates at 1024x1536 (the size this
+    # app actually generates at) — portrait/landscape pricing differs from the
+    # more commonly quoted 1024x1024 square rate, so these are model-specific.
+    COST_MAPS = {
+        "gpt-image-2": {"low": 0.005, "medium": 0.041, "high": 0.165},
+        "gpt-image-1": {"low": 0.016, "medium": 0.063, "high": 0.25},
+    }
+    if use_gemini:
+        cost_map = {"standard": 0.02, "hd": 0.08}
+    else:
+        cost_map = COST_MAPS[openai_model]
+
+    model_label = "Gemini imagen-3.0" if use_gemini else openai_model
     st.info(
         f"💰 **Estimated cost:** ~${cost_map[quality]:.3f} per image at **{quality}** quality "
-        f"(1024×1792 px, 9:16). "
+        f"on **{model_label}** (1024×1536 px, 9:16). "
         "No daily cap — pay only for what you generate."
     )
 
@@ -624,7 +643,7 @@ def render_step1():
     def call_openai_image(prompt: str) -> bytes:
         """Raw OpenAI image API call — returns PNG bytes."""
         response = openai_client.images.generate(
-            model="gpt-image-1",
+            model=openai_model,
             prompt=prompt,
             n=1,
             size="1024x1536",
@@ -1084,6 +1103,22 @@ def render_step2():
             )
             voice_id = voice_options[voice_name]
 
+        st.divider()
+        use_excel_voice = st.checkbox(
+            "Switch voices per scene (from Excel 'voice' column) when present",
+            value=True,
+            key="step2_excel_voice_enable",
+            help=(
+                "Add a 'voice' column to your Narration Excel. Each row can name a "
+                "voice (matching one in the dropdown above, e.g. 'Rachel') or paste "
+                "a raw ElevenLabs Voice ID directly. Leave a cell blank to keep using "
+                "whichever voice was last specified — handy for a narrator + a couple "
+                "of character voices without repeating the name on every row. If the "
+                "whole column is empty or unrecognized names are used, this falls "
+                "back to the single voice selected above."
+            ),
+        )
+
         tts_model = st.selectbox(
             "ElevenLabs model",
             ["eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_turbo_v2_5"],
@@ -1151,13 +1186,20 @@ def render_step2():
         st.subheader("Motion effect")
         effect_mode = st.radio(
             "Effect selection",
-            ["🤖 Auto — AI picks per scene", "✋ Manual — same for all scenes"],
+            [
+                "🤖 Auto — AI picks per scene",
+                "✋ Manual — same for all scenes",
+                "📋 From Excel — 'effect' column per scene",
+            ],
             index=0,
             key="step2_effect_mode",
             help=(
                 "Auto: reads each scene's script_text and picks the most fitting "
                 "motion effect automatically.\n\n"
-                "Manual: you pick one effect applied to every scene."
+                "Manual: you pick one effect applied to every scene.\n\n"
+                "From Excel: add an 'effect' column to your Narration Excel with one "
+                "of the exact names below per row (case-insensitive). Blank or "
+                "unrecognized cells fall back to Auto for that scene."
             ),
         )
         EFFECTS = [
@@ -1175,7 +1217,7 @@ def render_step2():
             "Effect (manual mode)",
             EFFECTS,
             index=0,
-            disabled=(effect_mode == "🤖 Auto — AI picks per scene"),
+            disabled=(effect_mode != "✋ Manual — same for all scenes"),
             key="step2_manual_effect",
         )
 
@@ -1479,6 +1521,7 @@ def render_step2():
                         "The team walked onto the field at Lord's, underdogs once again.",
                         "Kapil Dev led from the front, calm under pressure.",
                     ],
+                    "voice": ["Rachel", "", "Adam"],
                 })
                 buf = io.BytesIO()
                 sample.to_excel(buf, index=False)
@@ -1513,6 +1556,8 @@ def render_step2():
     has_excel_music_col = (
         "background music" in script_df.columns and script_df["background music"].notna().any()
     )
+    has_excel_voice_col = "voice" in script_df.columns and script_df["voice"].notna().any()
+    has_excel_effect_col = "effect" in script_df.columns and script_df["effect"].notna().any()
 
     script_df = script_df[script_df["script_text"].notna()].reset_index(drop=True)
 
@@ -1706,12 +1751,30 @@ def render_step2():
                 st.success("✅ Every split scene has enough clips uploaded — no repeats expected.")
 
 
-    def generate_voiceover(text: str, out_path: str):
+    def resolve_voice_id(value: str):
+        """Map an Excel 'voice' cell to an ElevenLabs voice_id.
+        Accepts either a voice name matching the sidebar dropdown (case-insensitive)
+        or a raw ElevenLabs voice_id pasted directly. Returns None if unresolvable."""
+        value = str(value).strip()
+        if not value:
+            return None
+        if not voices_err:
+            for name, vid in voice_options.items():
+                if name.lower() == value.lower():
+                    return vid
+        # Not a known name (or the voice list failed to load) — assume it's
+        # already a raw voice_id and let the API validate it.
+        if len(value) >= 15:
+            return value
+        return None
+
+    def generate_voiceover(text: str, out_path: str, voice_id_override: str = None):
+        vid = voice_id_override or voice_id
         last_err = None
         for attempt in range(3):
             try:
                 audio_iter = el_client.text_to_speech.convert(
-                    voice_id=voice_id,
+                    voice_id=vid,
                     text=text,
                     model_id=tts_model,
                     output_format="mp3_44100_128",
@@ -2186,10 +2249,15 @@ def render_step2():
         scene_moods = []       # per-scene resolved background-music mood, or None
         total = len(valid_df)
         auto_mode = effect_mode == "🤖 Auto — AI picks per scene"
+        excel_effect_mode = effect_mode == "📋 From Excel — 'effect' column per scene"
+        per_scene_effect_active = excel_effect_mode and has_excel_effect_col
+        EFFECTS_LOWER = {e.lower(): e for e in EFFECTS}
 
         per_scene_music_active = use_excel_sfx_music and has_excel_music_col
         per_scene_sfx_active = use_excel_sfx_music and has_excel_sfx_col
+        per_scene_voice_active = use_excel_voice and has_excel_voice_col
         last_seen_mood = None   # carries forward across blank "background music" cells
+        last_seen_voice_id = voice_id   # carries forward across blank "voice" cells
         clip_offsets = {}       # base scene id -> seconds already played from that source clip
 
         for i, row in valid_df.iterrows():
@@ -2197,7 +2265,21 @@ def render_step2():
             text = str(row["script_text"]).strip()
             media_path = row["image_path"]   # could be image OR pre-built clip
 
-            chosen_effect = ai_pick_effect(text) if auto_mode else manual_effect
+            if per_scene_effect_active:
+                e_cell = row.get("effect")
+                e_clean = str(e_cell).strip().lower() if isinstance(e_cell, str) else ""
+                if e_clean in EFFECTS_LOWER:
+                    chosen_effect = EFFECTS_LOWER[e_clean]
+                else:
+                    if e_clean:
+                        st.warning(
+                            f"Scene `{sid}`: effect '{e_cell.strip()}' not recognized "
+                            "— falling back to Auto for this scene. Valid names: "
+                            + ", ".join(EFFECTS)
+                        )
+                    chosen_effect = ai_pick_effect(text)
+            else:
+                chosen_effect = ai_pick_effect(text) if auto_mode else manual_effect
 
             if using_prebuilt_clips:
                 status.write(f"Processing {i+1}/{total}: `{sid}` — using pre-built clip")
@@ -2208,8 +2290,29 @@ def render_step2():
             video_only = os.path.join(work_dir, f"{safe_name(sid)}_video.mp4")
             clip_final = os.path.join(work_dir, f"{safe_name(sid)}_final.mp4")
 
+            # ── Optional per-scene voice (from Excel 'voice' column) ─────────────
+            scene_voice_label = ""
+            scene_voice_id = voice_id
+            if per_scene_voice_active:
+                v_cell = row.get("voice")
+                if isinstance(v_cell, str) and v_cell.strip():
+                    resolved = resolve_voice_id(v_cell)
+                    if resolved:
+                        scene_voice_id = resolved
+                        last_seen_voice_id = resolved
+                        scene_voice_label = v_cell.strip()
+                    else:
+                        st.warning(
+                            f"Scene `{sid}`: voice '{v_cell.strip()}' not recognized "
+                            "(no matching name in the dropdown and doesn't look like a "
+                            "raw Voice ID) — using the previous/default voice instead."
+                        )
+                        scene_voice_id = last_seen_voice_id
+                else:
+                    scene_voice_id = last_seen_voice_id   # carry forward blank cells
+
             try:
-                generate_voiceover(text, audio_path)
+                generate_voiceover(text, audio_path, scene_voice_id)
                 dur = get_duration(audio_path)
 
                 if using_prebuilt_clips:
@@ -2296,13 +2399,14 @@ def render_step2():
                     "effect": "pre-built clip" if using_prebuilt_clips else chosen_effect,
                     "duration_sec": round(dur, 2), "status": "✅ OK",
                     "sfx": ", ".join(sfx_used), "music_mood": scene_mood or "",
+                    "voice_id": scene_voice_id,
                 })
             except Exception as e:
                 results.append({
                     "id": sid, "script_text": text,
                     "effect": "pre-built clip" if using_prebuilt_clips else chosen_effect,
                     "duration_sec": None, "status": f"❌ {e}",
-                    "sfx": "", "music_mood": "",
+                    "sfx": "", "music_mood": "", "voice_id": scene_voice_id,
                 })
 
             progress.progress((i + 1) / total)
@@ -2437,15 +2541,298 @@ def render_step2():
 
 
 # ===========================================================================
+# STEP 3 — Standalone photo-slideshow-to-song (images ZIP + audio → pan/zoom)
+# No script, no voiceover, no connection to any other step/tab.
+# ===========================================================================
+def render_step3():
+    st.header("🎵 Step 3: Photo Slideshow to Song")
+    st.caption(
+        "Standalone tool: upload a ZIP of images + an audio track (a song) and get "
+        "a pan/zoom slideshow timed to the music. No Excel, no voiceover, no other "
+        "step required."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        images_zip = st.file_uploader(
+            "Images (.zip of .jpg/.png/.webp)", type=["zip"], key="step3_zip"
+        )
+    with col2:
+        audio_file = st.file_uploader(
+            "Audio / song", type=["mp3", "wav", "m4a", "aac", "ogg", "flac"], key="step3_audio"
+        )
+
+    if not images_zip or not audio_file:
+        st.info("Upload a ZIP of images and an audio file to continue.")
+        return
+
+    work_dir = tempfile.mkdtemp(prefix="slideshow_")
+    images_dir = os.path.join(work_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+
+    with zipfile.ZipFile(images_zip) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = os.path.basename(info.filename)
+            if not name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                continue
+            with zf.open(info) as src, open(os.path.join(images_dir, name), "wb") as dst:
+                dst.write(src.read())
+
+    image_paths = sorted(glob.glob(os.path.join(images_dir, "*")))
+    if not image_paths:
+        st.error("No image files found inside that ZIP (.jpg/.png/.webp/.bmp).")
+        return
+
+    audio_ext = os.path.splitext(audio_file.name)[1] or ".mp3"
+    audio_path = os.path.join(work_dir, f"input_audio{audio_ext}")
+    with open(audio_path, "wb") as f:
+        f.write(audio_file.getvalue())
+
+    def _probe_duration(path: str) -> float:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, check=True,
+        )
+        return float(r.stdout.strip())
+
+    try:
+        audio_duration = _probe_duration(audio_path)
+    except Exception as e:
+        st.error(f"Couldn't read audio duration (is this a valid audio file?): {e}")
+        return
+
+    n_images = len(image_paths)
+    st.success(f"Found **{n_images}** images · audio is **{audio_duration:.1f}s** long.")
+
+    st.subheader("⚙️ Settings")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        aspect_label = st.selectbox(
+            "Output aspect ratio",
+            ["Vertical 9:16 (Shorts/Reels)", "Square 1:1", "Horizontal 16:9 (YouTube)"],
+            key="step3_aspect",
+        )
+    with c2:
+        effect_mode = st.radio(
+            "Motion effect",
+            ["🎲 Random per image", "✋ Same for all"],
+            key="step3_effect_mode",
+        )
+    with c3:
+        fit_mode = st.radio(
+            "Timing",
+            ["Split audio evenly across images", "Set my own seconds per image"],
+            key="step3_fit_mode",
+        )
+
+    EFFECTS3 = [
+        "Slow zoom in", "Slow zoom out", "Pan left → right", "Pan right → left",
+        "Pan top → bottom", "Ken Burns (zoom + diagonal pan)", "Fade in / Fade out",
+        "Cross dissolve", "Handheld shake",
+    ]
+    manual_effect = None
+    if effect_mode == "✋ Same for all":
+        manual_effect = st.selectbox("Effect for every image", EFFECTS3, key="step3_manual_effect")
+
+    if fit_mode == "Split audio evenly across images":
+        seconds_per_image = audio_duration / n_images
+        st.caption(
+            f"→ Each image is on screen for **{seconds_per_image:.2f}s** "
+            f"(total video length matches the audio: {audio_duration:.1f}s)."
+        )
+    else:
+        seconds_per_image = st.slider(
+            "Seconds per image", 0.5, 20.0, round(audio_duration / n_images, 1), 0.1,
+            key="step3_seconds_per_image",
+        )
+        st.caption(
+            f"→ Total video length: **{seconds_per_image * n_images:.1f}s**. "
+            "The audio will be looped or trimmed automatically to match."
+        )
+
+    add_fade_out = st.checkbox(
+        "Fade audio out over the last 2 seconds", value=True, key="step3_audio_fadeout"
+    )
+
+    ASPECT_DIMS = {
+        "Vertical 9:16 (Shorts/Reels)": (1080, 1920),
+        "Square 1:1": (1080, 1080),
+        "Horizontal 16:9 (YouTube)": (1920, 1080),
+    }
+    out_w, out_h = ASPECT_DIMS[aspect_label]
+
+    project_id = st.text_input(
+        "Project name",
+        value=datetime.now().strftime("slideshow_%Y%m%d_%H%M%S"),
+        key="step3_project_id",
+    )
+
+    def make_clip3(image_path: str, duration: float, out_path: str, effect: str, w: int, h: int):
+        fps = 25
+        frames = max(int(duration * fps), 1)
+        TARGET = f"{w}x{h}"
+        SCALE_UP = f"scale={w*2}:{h*2},"
+
+        if effect == "Slow zoom in":
+            vf = (
+                f"{SCALE_UP}zoompan=z='min(zoom+0.0015,1.3)':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps}"
+            )
+        elif effect == "Slow zoom out":
+            vf = (
+                f"{SCALE_UP}zoompan=z='if(eq(on,1),1.3,max(zoom-0.0015,1.0))':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps}"
+            )
+        elif effect == "Pan left → right":
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.2':d={frames}:"
+                f"x='(iw-iw/zoom)*on/{frames}':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps}"
+            )
+        elif effect == "Pan right → left":
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.2':d={frames}:"
+                f"x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps}"
+            )
+        elif effect == "Pan top → bottom":
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.2':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*on/{frames}':s={TARGET}:fps={fps}"
+            )
+        elif effect == "Ken Burns (zoom + diagonal pan)":
+            vf = (
+                f"{SCALE_UP}zoompan=z='min(zoom+0.002,1.4)':d={frames}:"
+                f"x='(iw-iw/zoom)*on/{frames}':y='(ih-ih/zoom)*on/{frames}':s={TARGET}:fps={fps}"
+            )
+        elif effect == "Fade in / Fade out":
+            fade_dur = min(0.5, duration * 0.15)
+            fade_frames = max(int(fade_dur * fps), 1)
+            start_fade_out = max(frames - fade_frames, 1)
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.0':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps},"
+                f"fade=t=in:st=0:d={fade_dur},"
+                f"fade=t=out:st={start_fade_out/fps:.3f}:d={fade_dur}"
+            )
+        elif effect == "Cross dissolve":
+            fade_dur = min(0.4, duration * 0.15)
+            fade_frames = max(int(fade_dur * fps), 1)
+            start_fade_out = max(frames - fade_frames, 1)
+            vf = (
+                f"{SCALE_UP}zoompan=z='min(zoom+0.001,1.15)':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps},"
+                f"fade=t=in:st=0:d={fade_dur},"
+                f"fade=t=out:st={start_fade_out/fps:.3f}:d={fade_dur}"
+            )
+        elif effect == "Handheld shake":
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.08':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)+8*sin(on*0.7)':y='ih/2-(ih/zoom/2)+5*sin(on*1.1)'"
+                f":s={TARGET}:fps={fps}"
+            )
+        else:
+            vf = (
+                f"{SCALE_UP}zoompan=z='1.0':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={TARGET}:fps={fps}"
+            )
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-loop", "1", "-i", image_path, "-vf", vf,
+             "-t", str(duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", out_path],
+            capture_output=True, check=True,
+        )
+
+    if st.button("🎬 Generate slideshow video", type="primary", key="step3_generate_btn"):
+        progress = st.progress(0.0)
+        status = st.empty()
+
+        clip_paths = []
+        for idx, img_path in enumerate(image_paths):
+            try:
+                img = Image.open(img_path).convert("RGB")
+                img = ensure_9x16(img, out_w, out_h)   # generic centre-crop/resize to target aspect
+                fixed_img_path = os.path.join(work_dir, f"fixed_{idx:03d}.png")
+                img.save(fixed_img_path)
+
+                effect = manual_effect if manual_effect else random.choice(EFFECTS3)
+                clip_out = os.path.join(work_dir, f"clip_{idx:03d}.mp4")
+                make_clip3(fixed_img_path, seconds_per_image, clip_out, effect, out_w, out_h)
+                clip_paths.append(clip_out)
+                status.write(f"Rendered image {idx + 1}/{n_images} ({effect})")
+            except Exception as e:
+                st.warning(f"Skipped {os.path.basename(img_path)}: {e}")
+            progress.progress((idx + 1) / n_images)
+
+        if not clip_paths:
+            st.error("No clips were rendered — nothing to stitch.")
+            return
+
+        status.write("Stitching clips together...")
+        silent_video = os.path.join(work_dir, "silent.mp4")
+        list_file = os.path.join(work_dir, "concat_list.txt")
+        with open(list_file, "w") as f:
+            for p in clip_paths:
+                f.write(f"file '{p}'\n")
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
+                 "-c", "copy", silent_video],
+                capture_output=True, check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            st.error(f"ffmpeg error while stitching: {e.stderr.decode() if e.stderr else e}")
+            return
+
+        total_video_dur = seconds_per_image * len(clip_paths)
+
+        status.write("Adding the audio track...")
+        final_path = os.path.join(work_dir, f"{safe_name(project_id)}.mp4")
+        af_args = []
+        if add_fade_out and total_video_dur > 3:
+            fade_start = max(total_video_dur - 2.0, 0.0)
+            af_args = ["-af", f"afade=t=out:st={fade_start:.2f}:d=2"]
+
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", silent_video, "-stream_loop", "-1", "-i", audio_path,
+                 "-map", "0:v:0", "-map", "1:a:0", "-t", str(total_video_dur),
+                 "-c:v", "copy", "-c:a", "aac"] + af_args + [final_path],
+                capture_output=True, check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            st.error(f"ffmpeg error while adding audio: {e.stderr.decode() if e.stderr else e}")
+            return
+
+        status.write("Done ✅")
+        with open(final_path, "rb") as f:
+            final_bytes = f.read()
+
+        st.video(final_bytes)
+        st.download_button(
+            "⬇️ Download slideshow (.mp4)",
+            data=final_bytes,
+            file_name=f"{safe_name(project_id)}.mp4",
+            mime="video/mp4",
+            key="step3_video_dl",
+        )
+
+
+# ===========================================================================
 # Main layout
 # ===========================================================================
 st.title("🎬 Shorts Maker")
 st.caption("Excel → OpenAI images (9:16) → ElevenLabs voice → pan/zoom video → YouTube Short")
 
-tab1, tab15, tab2 = st.tabs(["① Generate Images", "① .5 Animate (fal.ai Wan)", "② Assemble Video"])
+tab1, tab15, tab2, tab3 = st.tabs(
+    ["① Generate Images", "① .5 Animate (fal.ai Wan)", "② Assemble Video", "🎵 Photo Slideshow to Song"]
+)
 with tab1:
     render_step1()
 with tab15:
     render_step15()
 with tab2:
     render_step2()
+with tab3:
+    render_step3()
