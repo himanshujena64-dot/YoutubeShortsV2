@@ -1,6 +1,7 @@
 import base64
 import glob
 import io
+import json
 import os
 import random
 import re
@@ -126,6 +127,8 @@ if "step1_scene_prompts" not in st.session_state:
     st.session_state.step1_scene_prompts = {}
 if "animated_clips" not in st.session_state:
     st.session_state.animated_clips = {}
+if "step2_preview_audio_bytes" not in st.session_state:
+    st.session_state.step2_preview_audio_bytes = None
 
 # ---------------------------------------------------------------------------
 # Mood classifier (Step 2 background music)
@@ -266,6 +269,54 @@ def pick_music_track(mood: str, music_root: str):
         if entry.is_dir():
             all_tracks.extend(tracks_in(entry.path))
     return random.choice(all_tracks) if all_tracks else None
+
+
+def measure_loudness(path: str, target_lufs: int):
+    """Run ffmpeg's loudnorm filter in analysis-only mode to measure this
+    specific file's real loudness/peak/range.
+
+    Single-pass loudnorm (what this app used before) has to *estimate* the
+    correction as it goes, and that estimate can be off by several dB —
+    worse on short clips or tracks with big dynamic swings. That's the main
+    reason the same LUFS slider value could sound clearly louder on one
+    music track and clearly quieter on another. Measuring first and feeding
+    the real numbers back in (a "two-pass" loudnorm) makes the target LUFS
+    land on the same perceived loudness for every track.
+
+    Returns None on any failure — callers fall back to plain single-pass
+    loudnorm rather than breaking the mix.
+    """
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-i", path, "-af",
+             f"loudnorm=I={target_lufs}:TP=-2:LRA=11:print_format=json",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=30,
+        )
+        stderr = result.stderr
+        start, end = stderr.rfind("{"), stderr.rfind("}")
+        if start == -1 or end == -1:
+            return None
+        return json.loads(stderr[start:end + 1])
+    except Exception:
+        return None
+
+
+def loudnorm_filter_string(path: str, target_lufs: int) -> str:
+    """Build a loudnorm filter expression for `path`. Uses a measured
+    (two-pass-equivalent) pass when possible so the target LUFS is hit
+    accurately and consistently across different music files; falls back to
+    plain single-pass loudnorm if measuring the file fails for any reason."""
+    stats = measure_loudness(path, target_lufs)
+    needed = ("input_i", "input_tp", "input_lra", "input_thresh")
+    if stats and all(k in stats for k in needed):
+        return (
+            f"loudnorm=I={target_lufs}:TP=-2:LRA=11:"
+            f"measured_I={stats['input_i']}:measured_TP={stats['input_tp']}:"
+            f"measured_LRA={stats['input_lra']}:measured_thresh={stats['input_thresh']}:"
+            f"linear=true"
+        )
+    return f"loudnorm=I={target_lufs}:TP=-2:LRA=11"
 
 
 def pick_sfx_clip(keyword: str, sfx_root: str):
@@ -1177,6 +1228,7 @@ def render_step2():
                             },
                         )
                         preview_bytes = b"".join(preview_audio)
+                        st.session_state.step2_preview_audio_bytes = preview_bytes
                         st.audio(preview_bytes, format="audio/mp3")
                     except Exception as e:
                         st.error(f"Preview failed: {e}")
@@ -1233,6 +1285,20 @@ def render_step2():
             ),
             disabled=not enable_music,
             key="step2_music_lufs",
+        )
+        music_gain_db = st.slider(
+            "Music volume trim (dB)", -8.0, 8.0, 0.0, 0.5,
+            help=(
+                "Quick fine-tune on top of the LUFS target above. Negative = "
+                "quieter, positive = louder. Music is now measured per-track "
+                "before normalizing (instead of estimated on the fly), so the "
+                "same LUFS setting should already sound consistent from track "
+                "to track — use this slider only for small final adjustments, "
+                "e.g. if one particular track still feels a touch too soft or "
+                "too loud even at the same LUFS value."
+            ),
+            disabled=not enable_music,
+            key="step2_music_gain_db",
         )
         duck_music_under_voice = st.checkbox(
             "Auto-duck music & SFX under the voice (recommended)",
@@ -1304,6 +1370,101 @@ def render_step2():
                     fmt = "audio/wav" if ext == "wav" else "audio/mp3"
                     st.audio(track_bytes, format=fmt)
                     st.caption(f"🎵 {os.path.basename(track)} ({preview_mood})")
+
+            st.caption(
+                "☝️ Raw track only, no volume/ducking applied. Use the full "
+                "mix preview below to hear it the way it'll actually sound "
+                "under the voice."
+            )
+            if st.button(
+                "🎧 Preview voice + music mix", key="step2_full_mix_preview_btn",
+                help=(
+                    "Builds a short combined clip using your current LUFS, "
+                    "volume trim, and ducking settings — so you can hear the "
+                    "real balance and adjust before generating the full video."
+                ),
+            ):
+                if not voice_id:
+                    st.warning("Select or enter a Voice ID first.")
+                else:
+                    with st.spinner("Building mix preview..."):
+                        try:
+                            voice_bytes = st.session_state.get("step2_preview_audio_bytes")
+                            if not voice_bytes:
+                                preview_audio = el_client.text_to_speech.convert(
+                                    voice_id=voice_id,
+                                    text=preview_text,
+                                    model_id=tts_model,
+                                    output_format="mp3_44100_128",
+                                    voice_settings={
+                                        "stability": voice_stability,
+                                        "similarity_boost": voice_similarity,
+                                        "style": voice_style,
+                                        "speed": voice_speed,
+                                    },
+                                )
+                                voice_bytes = b"".join(preview_audio)
+                                st.session_state.step2_preview_audio_bytes = voice_bytes
+
+                            track = pick_music_track(preview_mood, MUSIC_DIR)
+                            if track is None:
+                                st.warning(
+                                    f"No music files found in music/{preview_mood}/ — "
+                                    "add .mp3 files to that folder and redeploy."
+                                )
+                            else:
+                                with tempfile.TemporaryDirectory() as tmp:
+                                    voice_path = os.path.join(tmp, "voice.mp3")
+                                    with open(voice_path, "wb") as f:
+                                        f.write(voice_bytes)
+                                    mix_path = os.path.join(tmp, "mix.mp3")
+
+                                    loud_fc = loudnorm_filter_string(track, music_target_lufs)
+                                    gain_clause = (
+                                        f",volume={music_gain_db:.1f}dB"
+                                        if music_gain_db else ""
+                                    )
+                                    if duck_music_under_voice:
+                                        fc = (
+                                            f"[1:a]{loud_fc}{gain_clause}[music_norm];"
+                                            f"[music_norm][0:a]sidechaincompress="
+                                            f"threshold=0.05:ratio=8:attack=5:"
+                                            f"release=300:makeup=1[music_duck];"
+                                            f"[0:a][music_duck]amix=inputs=2:"
+                                            f"duration=first:dropout_transition=2:"
+                                            f"normalize=0[aout]"
+                                        )
+                                    else:
+                                        fc = (
+                                            f"[1:a]{loud_fc}{gain_clause}[music];"
+                                            f"[0:a][music]amix=inputs=2:"
+                                            f"duration=first:dropout_transition=2:"
+                                            f"normalize=0[aout]"
+                                        )
+                                    subprocess.run(
+                                        ["ffmpeg", "-y", "-i", voice_path,
+                                         "-stream_loop", "-1", "-i", track,
+                                         "-filter_complex", fc, "-map", "[aout]",
+                                         "-c:a", "libmp3lame", mix_path],
+                                        capture_output=True, check=True,
+                                    )
+                                    with open(mix_path, "rb") as f:
+                                        mix_bytes = f.read()
+
+                                st.audio(mix_bytes, format="audio/mp3")
+                                trim_note = (
+                                    f" · {music_gain_db:+.1f} dB trim" if music_gain_db else ""
+                                )
+                                duck_note = " · ducking on" if duck_music_under_voice else " · ducking off"
+                                st.caption(
+                                    f"🎙️ Voice + 🎵 {os.path.basename(track)} "
+                                    f"({preview_mood}) · {music_target_lufs} LUFS"
+                                    f"{trim_note}{duck_note}"
+                                )
+                        except subprocess.CalledProcessError as e:
+                            st.error(f"ffmpeg error: {e.stderr.decode() if e.stderr else e}")
+                        except Exception as e:
+                            st.error(f"Preview failed: {e}")
 
         st.divider()
         st.subheader("Scene-level SFX & music (optional, from Excel)")
@@ -2116,15 +2277,18 @@ def render_step2():
             capture_output=True, check=True,
         )
 
-    def mix_music(video_in: str, music: str, out: str, lufs: int, duck: bool = True):
+    def mix_music(video_in: str, music: str, out: str, lufs: int, duck: bool = True,
+                  gain_db: float = 0.0):
         duration = get_duration(video_in)
+        loud_fc = loudnorm_filter_string(music, lufs)
+        gain_clause = f",volume={gain_db:.1f}dB" if gain_db else ""
         if duck:
             # sidechaincompress uses the voice track ([0:a]) to automatically
             # pull the music down while someone is talking, and let it back up
             # in the gaps — this is what fixes music that feels constantly
             # "in your face" instead of sitting under the voice.
             fc = (
-                f"[1:a]loudnorm=I={lufs}:TP=-2:LRA=11[music_norm];"
+                f"[1:a]{loud_fc}{gain_clause}[music_norm];"
                 f"[music_norm][0:a]sidechaincompress=threshold=0.05:ratio=8:"
                 f"attack=5:release=300:makeup=1[music_duck];"
                 f"[0:a][music_duck]amix=inputs=2:duration=first:"
@@ -2132,7 +2296,7 @@ def render_step2():
             )
         else:
             fc = (
-                f"[1:a]loudnorm=I={lufs}:TP=-2:LRA=11[music];"
+                f"[1:a]{loud_fc}{gain_clause}[music];"
                 f"[0:a][music]amix=inputs=2:duration=first:"
                 f"dropout_transition=2:normalize=0[aout]"
             )
@@ -2197,7 +2361,7 @@ def render_step2():
         subprocess.run(cmd, capture_output=True, check=True)
 
     def build_scene_music_track(scene_moods: list, scene_durations: list, out_path: str,
-                                 lufs: int, crossfade_sec: float = 1.0):
+                                 lufs: int, crossfade_sec: float = 1.0, gain_db: float = 0.0):
         """Build one continuous background-music track for the whole video from
         a per-scene list of moods, crossfading whenever the mood changes between
         consecutive scenes. Scenes with the same mood as their neighbour just
@@ -2226,10 +2390,12 @@ def render_step2():
             # joins never come up short once acrossfade trims them back down.
             pad = crossfade_sec if idx < len(segments) - 1 else 0
             seg_out = os.path.join(work_dir, f"_music_seg_{idx}.m4a")
+            loud_fc = loudnorm_filter_string(track, lufs)
+            af = f"{loud_fc},volume={gain_db:.1f}dB" if gain_db else loud_fc
             subprocess.run(
                 ["ffmpeg", "-y", "-stream_loop", "-1", "-i", track,
                  "-t", str(dur + pad),
-                 "-af", f"loudnorm=I={lufs}:TP=-2:LRA=11",
+                 "-af", af,
                  "-c:a", "aac", seg_out],
                 capture_output=True, check=True,
             )
@@ -2525,7 +2691,8 @@ def render_step2():
                 status.write("Building per-scene background music (with crossfades)...")
                 composite_path = os.path.join(work_dir, "_music_composite.m4a")
                 composite = build_scene_music_track(
-                    filled_moods, scene_durations, composite_path, music_target_lufs
+                    filled_moods, scene_durations, composite_path, music_target_lufs,
+                    gain_db=music_gain_db,
                 )
                 if composite is None:
                     st.warning(
@@ -2555,7 +2722,8 @@ def render_step2():
                 else:
                     status.write(f"Adding background music (mood: {mood})...")
                     with_music = os.path.join(work_dir, f"{project_id}_with_music.mp4")
-                    mix_music(final_path, music_track, with_music, music_target_lufs, duck=duck_music_under_voice)
+                    mix_music(final_path, music_track, with_music, music_target_lufs,
+                              duck=duck_music_under_voice, gain_db=music_gain_db)
                     final_path = with_music
                     st.info(f"🎵 Music: **{os.path.basename(music_track)}** (mood: {mood})")
 
