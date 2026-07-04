@@ -1753,17 +1753,36 @@ def render_step2():
 
     def resolve_voice_id(value: str):
         """Map an Excel 'voice' cell to an ElevenLabs voice_id.
-        Accepts either a voice name matching the sidebar dropdown (case-insensitive)
-        or a raw ElevenLabs voice_id pasted directly. Returns None if unresolvable."""
+        Accepts a voice name matching the sidebar dropdown, a partial/prefix
+        match (voice names in your ElevenLabs account are often longer, e.g.
+        'Omar J – Deep Warm Storyteller' when the Excel just says 'Omar J'),
+        a close-typo match, or a raw ElevenLabs voice_id pasted directly.
+        Returns None if unresolvable."""
         value = str(value).strip()
         if not value:
             return None
+        value_low = value.lower()
+
         if not voices_err:
+            # 1) exact match
             for name, vid in voice_options.items():
-                if name.lower() == value.lower():
+                if name.lower() == value_low:
                     return vid
-        # Not a known name (or the voice list failed to load) — assume it's
-        # already a raw voice_id and let the API validate it.
+            # 2) substring / prefix match either direction — handles
+            # ElevenLabs' "Name – Description" style voice names.
+            for name, vid in voice_options.items():
+                name_low = name.lower()
+                if name_low.startswith(value_low) or value_low in name_low:
+                    return vid
+            # 3) close-typo fuzzy match on the full name list
+            import difflib
+            close = difflib.get_close_matches(value_low, [n.lower() for n in voice_options], n=1, cutoff=0.6)
+            if close:
+                for name, vid in voice_options.items():
+                    if name.lower() == close[0]:
+                        return vid
+        # Not a known/matchable name (or the voice list failed to load) —
+        # assume it's already a raw voice_id and let the API validate it.
         if len(value) >= 15:
             return value
         return None
@@ -2302,10 +2321,17 @@ def render_step2():
                         last_seen_voice_id = resolved
                         scene_voice_label = v_cell.strip()
                     else:
+                        available = (
+                            ", ".join(voice_options.keys()) if not voices_err
+                            else "(voice list unavailable — using manual Voice ID mode)"
+                        )
                         st.warning(
-                            f"Scene `{sid}`: voice '{v_cell.strip()}' not recognized "
-                            "(no matching name in the dropdown and doesn't look like a "
-                            "raw Voice ID) — using the previous/default voice instead."
+                            f"Scene `{sid}`: voice '{v_cell.strip()}' not recognized — no "
+                            "close match in your ElevenLabs account and it doesn't look "
+                            "like a raw Voice ID. Using the previous/default voice instead.\n\n"
+                            f"Voices currently in your account: {available}\n\n"
+                            "If the name you want isn't listed, add it in ElevenLabs → "
+                            "Voice Library → 'Add to my voices' first."
                         )
                         scene_voice_id = last_seen_voice_id
                 else:
