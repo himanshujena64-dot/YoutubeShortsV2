@@ -1226,21 +1226,27 @@ def render_step2():
         enable_music = st.checkbox("Add background music", value=True, key="step2_music_enable")
         music_target_lufs = st.slider(
             "Music level (LUFS)", -40, -20, -30,
-            help="-30 = clearly under voice. Higher = more present music.",
+            help=(
+                "-30 = clearly under voice. Higher (e.g. -22) = more present music. "
+                "If narration is still hard to hear in specific scenes even with "
+                "ducking on, lower this further (-34 to -38) rather than raising it."
+            ),
             disabled=not enable_music,
             key="step2_music_lufs",
         )
         duck_music_under_voice = st.checkbox(
-            "Auto- duck music under the voice (recommended)",
+            "Auto-duck music & SFX under the voice (recommended)",
             value=True,
-            disabled=not enable_music,
             key="step2_duck_music",
             help=(
-                "Automatically lowers the music volume whenever the voiceover is "
-                "speaking, then lets it come back up in the gaps — like a real "
-                "editor riding the fader. This is usually what fixes music that "
-                "feels constant/irritating throughout the whole video, without "
-                "needing to just turn the music down everywhere."
+                "Automatically lowers background music AND any per-scene SFX "
+                "(thunder, fire crackle, footsteps, etc.) whenever the voiceover "
+                "is speaking, then lets them come back up in the gaps — like a "
+                "real editor riding the fader. This is what fixes scenes where "
+                "music and SFX stack on top of each other (e.g. a storm scene "
+                "with both dramatic music and thunder/fire SFX) and end up "
+                "burying the narration. Stays on even if background music is "
+                "off, since it also protects the voice from loud SFX layers."
             ),
         )
         music_override = st.selectbox(
@@ -2137,7 +2143,7 @@ def render_step2():
             capture_output=True, check=True,
         )
 
-    def mix_layered_sfx_into_clip(clip_in: str, layers: list, out: str):
+    def mix_layered_sfx_into_clip(clip_in: str, layers: list, out: str, duck: bool = True):
         """Overlay one or more SFX layers onto a single scene clip, under the
         voiceover already muxed into clip_in. Each layer is a dict:
             {"path": str, "volume": float, "sustain": bool, "fade_in": bool}
@@ -2146,6 +2152,11 @@ def render_step2():
           start and is trimmed if it runs long — never extends the scene.
         - fade_in=True ramps the layer in from silence instead of starting
           at full volume immediately.
+        duck=True pulls each SFX layer down automatically while the voice is
+        speaking (same sidechain technique as the background-music mixer) —
+        without this, a loud ambient/one-shot SFX cue can stack right on top
+        of dramatic background music and bury the narration, especially
+        across several consecutive SFX-heavy scenes (e.g. a storm sequence).
         Never raises past this point being reached — if a layer's ffmpeg
         input is bad, the caller has already validated the path exists."""
         duration = get_duration(clip_in)
@@ -2163,13 +2174,22 @@ def render_step2():
             if layer["fade_in"]:
                 fade_len = min(duration, 4.0) if not layer["sustain"] else duration
                 chain += f",afade=t=in:st=0:d={fade_len:.2f}"
-            chain += f",atrim=0:{duration:.3f}[a{idx}]"
-            filter_parts.append(chain)
+            chain += f",atrim=0:{duration:.3f}"
+            if duck:
+                chain += f"[araw{idx}]"
+                filter_parts.append(chain)
+                filter_parts.append(
+                    f"[araw{idx}][0:a]sidechaincompress=threshold=0.05:ratio=6:"
+                    f"attack=5:release=300:makeup=1[a{idx}]"
+                )
+            else:
+                chain += f"[a{idx}]"
+                filter_parts.append(chain)
             mix_labels.append(f"[a{idx}]")
 
         filter_parts.append(
             f"{''.join(mix_labels)}amix=inputs={len(layers) + 1}:"
-            f"duration=first:dropout_transition=0.3[aout]"
+            f"duration=first:dropout_transition=0.3:normalize=0[aout]"
         )
         fc = ";".join(filter_parts)
         cmd += ["-filter_complex", fc, "-map", "0:v", "-map", "[aout]",
@@ -2402,7 +2422,7 @@ def render_step2():
                             sfx_used.append(os.path.basename(sfx_path))
                         if layers:
                             sfx_out = os.path.join(work_dir, f"{safe_name(sid)}_sfx.mp4")
-                            mix_layered_sfx_into_clip(clip_final, layers, sfx_out)
+                            mix_layered_sfx_into_clip(clip_final, layers, sfx_out, duck=duck_music_under_voice)
                             clip_final = sfx_out
 
                 clip_paths.append(clip_final)
