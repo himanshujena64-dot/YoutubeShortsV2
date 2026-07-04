@@ -247,7 +247,8 @@ def pick_music_track(mood: str, music_root: str):
         result = []
         if not os.path.isdir(folder):
             return result
-        for ext in ("*.mp3", "*.wav", "*.m4a"):
+        # Case-insensitive: some uploads land as .MP3/.WAV, glob is case-sensitive on Linux
+        for ext in ("*.mp3", "*.wav", "*.m4a", "*.MP3", "*.WAV", "*.M4A"):
             result.extend(glob.glob(os.path.join(folder, ext)))
         return result
 
@@ -281,7 +282,8 @@ def pick_sfx_clip(keyword: str, sfx_root: str):
 
     def tracks_in(folder):
         result = []
-        for ext in ("*.mp3", "*.wav", "*.m4a"):
+        # Case-insensitive: some uploads land as .MP3/.WAV, glob is case-sensitive on Linux
+        for ext in ("*.mp3", "*.wav", "*.m4a", "*.MP3", "*.WAV", "*.M4A"):
             result.extend(glob.glob(os.path.join(folder, ext)))
         return result
 
@@ -1186,6 +1188,19 @@ def render_step2():
             disabled=not enable_music,
             key="step2_music_lufs",
         )
+        duck_music_under_voice = st.checkbox(
+            "Auto- duck music under the voice (recommended)",
+            value=True,
+            disabled=not enable_music,
+            key="step2_duck_music",
+            help=(
+                "Automatically lowers the music volume whenever the voiceover is "
+                "speaking, then lets it come back up in the gaps — like a real "
+                "editor riding the fader. This is usually what fixes music that "
+                "feels constant/irritating throughout the whole video, without "
+                "needing to just turn the music down everywhere."
+            ),
+        )
         music_override = st.selectbox(
             "Mood override",
             [
@@ -1270,6 +1285,41 @@ def render_step2():
             ),
         )
 
+        with st.expander("🔍 Check SFX / Music library (see what's actually loaded)"):
+            st.caption(
+                "This lists every sfx/ and music/ subfolder and how many audio "
+                "files are sitting inside it right now. A folder with 0 files "
+                "will never produce a match, even if your script's cue text is "
+                "exactly right — this is the #1 cause of 'no SFX match' warnings."
+            )
+
+            def _count_files(root, folders):
+                rows = []
+                for name in folders:
+                    folder_path = os.path.join(root, name)
+                    n = 0
+                    if os.path.isdir(folder_path):
+                        for ext in ("*.mp3", "*.wav", "*.m4a", "*.MP3", "*.WAV", "*.M4A"):
+                            n += len(glob.glob(os.path.join(folder_path, ext)))
+                    rows.append({"folder": name, "files": n})
+                return pd.DataFrame(rows)
+
+            col_sfx, col_music = st.columns(2)
+            with col_sfx:
+                st.markdown("**SFX folders**")
+                sfx_df = _count_files(SFX_DIR, _SFX_FOLDERS)
+                empty_sfx = sfx_df[sfx_df["files"] == 0]["folder"].tolist()
+                st.dataframe(sfx_df, use_container_width=True, height=250)
+                if empty_sfx:
+                    st.warning(f"{len(empty_sfx)} empty: {', '.join(empty_sfx)}")
+            with col_music:
+                st.markdown("**Music mood folders**")
+                music_df = _count_files(MUSIC_DIR, _MOOD_FOLDERS)
+                empty_music = music_df[music_df["files"] == 0]["folder"].tolist()
+                st.dataframe(music_df, use_container_width=True, height=250)
+                if empty_music:
+                    st.warning(f"{len(empty_music)} empty: {', '.join(empty_music)}")
+
         st.divider()
         st.subheader("Outro")
         add_outro = st.checkbox(
@@ -1303,6 +1353,24 @@ def render_step2():
             ),
             key="step2_max_words",
         )
+
+        short_clip_strategy = st.radio(
+            "When a pre-built clip is shorter than its voiceover chunk",
+            ["Continue playback seamlessly (recommended)", "Gentle slow-motion (up to 2x slower)"],
+            index=0,
+            key="step2_short_clip_strategy",
+            help=(
+                "A long scene gets auto-split into several voiceover chunks that all "
+                "share the same source clip. 'Continue playback seamlessly' keeps "
+                "picking up from where the clip left off (looping only once it "
+                "reaches the end) instead of restarting from frame 0 every chunk — "
+                "this is what fixes the same clip visibly 'jumping back' and "
+                "repeating 2-3 times. 'Gentle slow-motion' instead stretches the "
+                "clip's own footage (never past half speed) to fill the time, so "
+                "there's no repeat at all, at the cost of slightly slower motion."
+            ),
+        )
+        use_slowmo_for_short_clips = short_clip_strategy.startswith("Gentle slow-motion")
 
         project_id = st.text_input(
             "Project ID",
@@ -1359,7 +1427,11 @@ def render_step2():
         st.markdown(
             "**Naming rule:** `scene_01.mp4` → Excel row `id = scene_01`. "
             "Each clip can be any length — voiceover duration controls the final clip timing. "
-            "Row order in Excel controls scene sequence."
+            "Row order in Excel controls scene sequence.\n\n"
+            "**Want to avoid a clip repeating when a long scene auto-splits?** Upload "
+            "*several* clips for the same scene id — `scene_01_a.mp4`, `scene_01_b.mp4`, "
+            "`scene_01_c.mp4` — and the app will automatically rotate through them for "
+            "each split chunk instead of reusing/looping just one."
         )
         clips_zip = st.file_uploader(
             "Pre-made video clips (.zip of .mp4/.mov files)",
@@ -1488,10 +1560,29 @@ def render_step2():
                 return path
         return None
 
+    def find_all_media(scene_id: str):
+        """Like find_media, but returns every matching file for this scene id,
+        sorted by filename. Used so several clips uploaded for one scene
+        (scene_01_a.mp4, scene_01_b.mp4, ...) can all be rotated through
+        instead of only the first one ever being used."""
+        sid = str(scene_id).strip()
+        search_pool = clip_files_prebuilt if using_prebuilt_clips else image_files
+        exact, prefixed = [], []
+        for path in search_pool:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            if stem == sid:
+                exact.append(path)
+            elif stem.startswith(sid + "_") or stem.startswith(sid + "-"):
+                prefixed.append(path)
+        matches = sorted(exact) + sorted(prefixed)
+        return matches or None
+
     # Keep backward-compat alias
     find_image = find_media
 
     script_df["image_path"] = script_df["id"].apply(find_image)
+    if using_prebuilt_clips:
+        script_df["clip_pool"] = script_df["id"].apply(find_all_media)
     missing = script_df[script_df["image_path"].isna()]
 
     st.subheader("Scene matching")
@@ -1499,7 +1590,18 @@ def render_step2():
     preview_df["image_path"] = preview_df["image_path"].apply(
         lambda p: f"✅ {os.path.basename(p)}" if isinstance(p, str) else "❌ not found"
     )
+    if using_prebuilt_clips and "clip_pool" in script_df.columns:
+        preview_df["clips_found"] = script_df["clip_pool"].apply(
+            lambda pool: len(pool) if isinstance(pool, list) else 0
+        )
     st.dataframe(preview_df, use_container_width=True)
+
+    if using_prebuilt_clips and "clip_pool" in script_df.columns:
+        st.caption(
+            "`clips_found` > 1 means several clips were matched to that scene id "
+            "(e.g. scene_01_a.mp4, scene_01_b.mp4) — the app rotates through them "
+            "if that scene ends up auto-split into multiple chunks."
+        )
 
     if len(missing) > 0:
         st.warning(
@@ -1569,6 +1671,39 @@ def render_step2():
             ),
             use_container_width=True,
         )
+
+        # ── Explicit alert: which of the split scenes will reuse one clip ──────
+        # This is the direct answer to "how do I know a scene needs extra
+        # clips" — without this, the only way to find out was to render the
+        # whole video and notice a clip repeating.
+        if using_prebuilt_clips and "clip_pool" in valid_df.columns:
+            split_base_ids = (
+                valid_df["id"].astype(str).str.extract(r"^(.*)_p\d+$")[0].dropna().unique().tolist()
+            )
+            needs_extra_clips = []
+            for base_id in split_base_ids:
+                chunk_rows = valid_df[valid_df["id"].astype(str).str.startswith(base_id + "_p")]
+                n_chunks = len(chunk_rows)
+                pool = chunk_rows.iloc[0]["clip_pool"]
+                n_clips = len(pool) if isinstance(pool, list) else 0
+                if n_chunks > n_clips:
+                    needs_extra_clips.append((base_id, n_chunks, n_clips))
+
+            if needs_extra_clips:
+                lines = "\n".join(
+                    f"- **{bid}** — split into {n_chunks} chunks but only "
+                    f"{n_clips or 'no'} clip{'s' if n_clips != 1 else ''} uploaded "
+                    f"→ footage will loop/repeat"
+                    for bid, n_chunks, n_clips in needs_extra_clips
+                )
+                st.warning(
+                    "⚠️ **These scenes will reuse/loop the same clip** because they "
+                    "got split into more chunks than they have clips for. Upload "
+                    "extra clips for these (e.g. `scene_05_a.mp4`, `scene_05_b.mp4`) "
+                    "if you want fresh footage for every chunk instead:\n\n" + lines
+                )
+            else:
+                st.success("✅ Every split scene has enough clips uploaded — no repeats expected.")
 
 
     def generate_voiceover(text: str, out_path: str):
@@ -1833,6 +1968,49 @@ def render_step2():
             capture_output=True, check=True,
         )
 
+    def build_prebuilt_scene_video(media_path: str, dur: float, offset_sec: float,
+                                    video_only: str, use_slowmo: bool):
+        """Render a pre-built stock clip to exactly `dur` seconds of video.
+
+        A long scene gets auto-split into several voiceover chunks that all
+        point at the *same* source clip. Naively re-trimming from frame 0 for
+        every chunk makes the same footage visibly "jump back" and repeat
+        2-3 times in a row. Two strategies avoid that:
+
+        - use_slowmo=True: stretch the clip's own footage with setpts (never
+          slower than 0.5x) so it fills the duration without any repeat.
+        - use_slowmo=False (default): keep playing from wherever the previous
+          chunk of this same clip left off (offset_sec), wrapping around only
+          once the source is exhausted — so it reads as continuous footage
+          instead of restarting from the beginning each time.
+        """
+        vf_scale = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+        src_dur = get_duration(media_path)
+        if src_dur <= 0.1:
+            src_dur = dur  # ffprobe failed for some reason — fall back to old behaviour
+
+        if use_slowmo and src_dur < dur:
+            speed = max(src_dur / dur, 0.5)  # never go past half-speed
+            pts_mult = 1.0 / speed
+            subprocess.run(
+                ["ffmpeg", "-y", "-stream_loop", "-1", "-i", media_path,
+                 "-vf", f"setpts={pts_mult:.4f}*PTS,{vf_scale}",
+                 "-t", str(dur),
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                 "-an", video_only],
+                capture_output=True, check=True,
+            )
+        else:
+            offset_mod = offset_sec % src_dur if src_dur > 0 else 0.0
+            subprocess.run(
+                ["ffmpeg", "-y", "-stream_loop", "-1", "-ss", str(offset_mod), "-i", media_path,
+                 "-t", str(dur),
+                 "-vf", vf_scale,
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                 "-an", video_only],
+                capture_output=True, check=True,
+            )
+
     def mux(video: str, audio: str, out: str):
         subprocess.run(
             ["ffmpeg", "-y", "-i", video, "-i", audio,
@@ -1850,12 +2028,26 @@ def render_step2():
             capture_output=True, check=True,
         )
 
-    def mix_music(video_in: str, music: str, out: str, lufs: int):
+    def mix_music(video_in: str, music: str, out: str, lufs: int, duck: bool = True):
         duration = get_duration(video_in)
-        fc = (
-            f"[1:a]loudnorm=I={lufs}:TP=-2:LRA=11[music];"
-            f"[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-        )
+        if duck:
+            # sidechaincompress uses the voice track ([0:a]) to automatically
+            # pull the music down while someone is talking, and let it back up
+            # in the gaps — this is what fixes music that feels constantly
+            # "in your face" instead of sitting under the voice.
+            fc = (
+                f"[1:a]loudnorm=I={lufs}:TP=-2:LRA=11[music_norm];"
+                f"[music_norm][0:a]sidechaincompress=threshold=0.05:ratio=8:"
+                f"attack=5:release=300:makeup=1[music_duck];"
+                f"[0:a][music_duck]amix=inputs=2:duration=first:"
+                f"dropout_transition=2:normalize=0[aout]"
+            )
+        else:
+            fc = (
+                f"[1:a]loudnorm=I={lufs}:TP=-2:LRA=11[music];"
+                f"[0:a][music]amix=inputs=2:duration=first:"
+                f"dropout_transition=2:normalize=0[aout]"
+            )
         subprocess.run(
             ["ffmpeg", "-y", "-i", video_in, "-stream_loop", "-1", "-i", music,
              "-filter_complex", fc, "-map", "0:v", "-map", "[aout]",
@@ -1963,13 +2155,22 @@ def render_step2():
         os.replace(current, out_path)
         return out_path
 
-    def mix_prebuilt_music_track(video_in: str, music_path: str, out: str):
+    def mix_prebuilt_music_track(video_in: str, music_path: str, out: str, duck: bool = True):
         """Mix a music track that's already the right length (built per-scene)
         into the final video, without the stream_loop/duration-matching that
         mix_music() does for a single repeating track."""
+        if duck:
+            fc = (
+                "[1:a][0:a]sidechaincompress=threshold=0.05:ratio=8:"
+                "attack=5:release=300:makeup=1[music_duck];"
+                "[0:a][music_duck]amix=inputs=2:duration=first:"
+                "dropout_transition=2:normalize=0[aout]"
+            )
+        else:
+            fc = "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
         subprocess.run(
             ["ffmpeg", "-y", "-i", video_in, "-i", music_path,
-             "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+             "-filter_complex", fc,
              "-map", "0:v", "-map", "[aout]",
              "-c:v", "copy", "-c:a", "aac", "-shortest", out],
             capture_output=True, check=True,
@@ -1989,6 +2190,7 @@ def render_step2():
         per_scene_music_active = use_excel_sfx_music and has_excel_music_col
         per_scene_sfx_active = use_excel_sfx_music and has_excel_sfx_col
         last_seen_mood = None   # carries forward across blank "background music" cells
+        clip_offsets = {}       # base scene id -> seconds already played from that source clip
 
         for i, row in valid_df.iterrows():
             sid = str(row["id"])
@@ -2011,22 +2213,35 @@ def render_step2():
                 dur = get_duration(audio_path)
 
                 if using_prebuilt_clips:
-                    # Trim OR loop the pre-built clip to match voiceover duration.
-                    # -stream_loop -1 loops the source indefinitely so that even a
-                    # short stock clip (e.g. 5s) is padded out to match a longer
-                    # voiceover (e.g. 12s) instead of being silently truncated by
-                    # the "-shortest" flag in mux() below. Without this, the video
-                    # track ends before the voiceover does, mux() cuts the audio
-                    # short to match, and the *next* scene's voice starts right on
-                    # top of the abrupt cut — which is what reads as "overlap".
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-stream_loop", "-1", "-i", media_path,
-                         "-t", str(dur),
-                         "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-                         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                         "-an", video_only],
-                        capture_output=True, check=True,
-                    )
+                    # Match the video to the voiceover duration without either
+                    # (a) truncating it short — which caused the "overlap" bug,
+                    # or (b) restarting from frame 0 for every split-chunk of a
+                    # long scene — which caused the same clip to visibly repeat
+                    # 2-3 times in a row. base_id groups split chunks (e.g.
+                    # "scene_05_p1", "scene_05_p2") back to their shared scene.
+                    base_id = re.sub(r"_p\d+$", "", sid)
+                    clip_pool = row.get("clip_pool")
+
+                    if isinstance(clip_pool, list) and len(clip_pool) > 1:
+                        # Several clips were uploaded for this one scene id —
+                        # rotate through them per split-chunk so each chunk
+                        # gets genuinely different footage instead of a repeat.
+                        pool_idx = clip_offsets.get(base_id + "__pool_idx", 0)
+                        clip_for_chunk = clip_pool[pool_idx % len(clip_pool)]
+                        clip_offsets[base_id + "__pool_idx"] = pool_idx + 1
+                        build_prebuilt_scene_video(
+                            clip_for_chunk, dur, 0.0, video_only,
+                            use_slowmo=use_slowmo_for_short_clips,
+                        )
+                    else:
+                        # Only one clip for this scene — keep playback
+                        # continuous across split-chunks instead of restarting.
+                        offset = clip_offsets.get(base_id, 0.0)
+                        build_prebuilt_scene_video(
+                            media_path, dur, offset, video_only,
+                            use_slowmo=use_slowmo_for_short_clips,
+                        )
+                        clip_offsets[base_id] = offset + dur
                 else:
                     make_clip(media_path, dur, video_only, chosen_effect)
 
@@ -2169,7 +2384,7 @@ def render_step2():
                     )
                 else:
                     with_music = os.path.join(work_dir, f"{project_id}_with_music.mp4")
-                    mix_prebuilt_music_track(final_path, composite, with_music)
+                    mix_prebuilt_music_track(final_path, composite, with_music, duck=duck_music_under_voice)
                     final_path = with_music
                     import itertools
                     mood_sequence = " → ".join(m for m, _ in itertools.groupby(filled_moods))
@@ -2190,7 +2405,7 @@ def render_step2():
                 else:
                     status.write(f"Adding background music (mood: {mood})...")
                     with_music = os.path.join(work_dir, f"{project_id}_with_music.mp4")
-                    mix_music(final_path, music_track, with_music, music_target_lufs)
+                    mix_music(final_path, music_track, with_music, music_target_lufs, duck=duck_music_under_voice)
                     final_path = with_music
                     st.info(f"🎵 Music: **{os.path.basename(music_track)}** (mood: {mood})")
 
