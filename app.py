@@ -1014,7 +1014,8 @@ def render_step15():
         st.subheader("Step 1.5 — Animation settings")
         clip_duration = st.selectbox(
             "Clip duration (seconds)", [5, 10], index=0,
-            help="5 sec costs ~$0.025/clip · 10 sec costs ~$0.05/clip on fal.ai free trial.",
+            help="fal-ai/wan-i2v is priced per video at 480p, not per second — "
+                 "roughly $0.20/clip regardless of the duration chosen here.",
             key="step15_duration",
         )
         default_motion = st.text_input(
@@ -1024,9 +1025,9 @@ def render_step15():
         )
 
     st.info(
-        f"💰 Estimated cost: ~${len(images) * 0.025 * (clip_duration // 5):.2f} "
-        f"for {len(images)} clips at {clip_duration}s each. "
-        "fal.ai gives $5 free trial credit — enough for ~200 clips."
+        f"💰 Estimated cost: ~${len(images) * 0.20:.2f} "
+        f"for {len(images)} clips ({clip_duration}s each, 480p). "
+        "fal.ai gives $5 free trial credit — enough for ~25 clips at this rate."
     )
 
     if st.button("🎞️ Animate all scenes", type="primary", key="step15_animate_btn"):
@@ -1058,14 +1059,24 @@ def render_step15():
                 img_url = fal_client.upload_file(tmp_path)
                 os.unlink(tmp_path)
 
-                # Call Wan 2.1 image-to-video
+                # NOTE: the endpoint "fal-ai/wan/v2.1/image-to-video" does not
+                # exist on fal.ai (that's what was here before, and it made
+                # every single request fail with an opaque server error). The
+                # correct, current endpoint is "fal-ai/wan-i2v", which takes
+                # num_frames (81-100) + frames_per_second instead of a
+                # "duration" field. Solve for the fps that makes
+                # num_frames/fps equal the requested clip_duration.
+                num_frames = 100
+                fps = max(5, min(24, round(num_frames / int(clip_duration))))
                 result = fal_client.subscribe(
-                    "fal-ai/wan/v2.1/image-to-video",
+                    "fal-ai/wan-i2v",
                     arguments={
                         "image_url": img_url,
                         "prompt": vp,
-                        "duration": str(clip_duration),
+                        "num_frames": num_frames,
+                        "frames_per_second": fps,
                         "resolution": "480p",
+                        "aspect_ratio": "9:16",
                     },
                     with_logs=False,
                 )
@@ -1079,8 +1090,17 @@ def render_step15():
                 status.write(f"✅ {i+1}/{total} done: `{sid}`")
 
             except Exception as e:
-                results.append({"id": sid, "status": f"❌ {e}", "prompt_used": vp})
-                status.write(f"❌ {i+1}/{total} FAILED: `{sid}`")
+                # fal_client's exceptions can stringify to unhelpful raw
+                # headers/objects for some error types — pull out the parts
+                # that actually explain what went wrong when available.
+                status_code = getattr(e, "status_code", None)
+                msg = getattr(e, "message", None) or str(e)
+                if status_code:
+                    err_text = f"HTTP {status_code}: {msg}"
+                else:
+                    err_text = f"{type(e).__name__}: {msg}"
+                results.append({"id": sid, "status": f"❌ {err_text}", "prompt_used": vp})
+                status.write(f"❌ {i+1}/{total} FAILED: `{sid}` — {err_text}")
 
             progress.progress((i + 1) / total)
 
