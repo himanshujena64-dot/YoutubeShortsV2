@@ -888,6 +888,17 @@ def render_step1():
     # so you can come back, review, and fix specific scenes any time.
     if st.session_state.generated_images:
         st.divider()
+        st.subheader("🖼️ Generated images")
+        st.caption(f"{len(st.session_state.generated_images)} image(s) ready.")
+        gallery_items = list(st.session_state.generated_images.items())
+        cols_per_row = 4
+        for row_start in range(0, len(gallery_items), cols_per_row):
+            cols = st.columns(cols_per_row)
+            for col, (sid, (fname, ibytes)) in zip(cols, gallery_items[row_start:row_start + cols_per_row]):
+                with col:
+                    st.image(ibytes, caption=sid, use_container_width=True)
+
+        st.divider()
         st.subheader("🔍 Review & fix individual images")
         st.caption(
             "Not happy with a specific scene? Edit its prompt below and regenerate "
